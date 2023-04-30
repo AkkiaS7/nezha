@@ -1,4 +1,4 @@
-name: Agent release
+name: Test Agent release
 
 on:
   workflow_dispatch:
