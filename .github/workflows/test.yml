@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - master
+      - selfhost
   pull_request:
     branches:
       - master
+      - selfhost
   merge_group:
 
 permissions:
