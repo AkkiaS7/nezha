@@ -31,10 +31,10 @@ func TestPolicy_NezhaQualityWorkflow(t *testing.T) {
 	// Then
 	triggers := mappingNodeValue(root, "on")
 	require.NotNil(t, mappingNodeValue(triggers, "merge_group"))
-	// selfhost: the fork's selfhost branch also runs the quality workflow.
-	require.Equal(t, []string{"master", "selfhost"}, workflow.Triggers.Push.Branches)
+	// selfhost/integration: the fork's selfhost and integration branches also run the quality workflow.
+	require.Equal(t, []string{"master", "selfhost", "integration"}, workflow.Triggers.Push.Branches)
 	require.Empty(t, workflow.Triggers.Push.Paths)
-	require.Equal(t, []string{"master", "selfhost"}, workflow.Triggers.PullRequest.Branches)
+	require.Equal(t, []string{"master", "selfhost", "integration"}, workflow.Triggers.PullRequest.Branches)
 	require.Empty(t, workflow.Triggers.PullRequest.Paths)
 	require.Equal(t, map[string]string{"contents": "read"}, workflow.Permissions)
 	require.NotEmpty(t, workflow.Concurrency.Group)
