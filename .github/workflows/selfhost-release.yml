@@ -1,0 +1,200 @@
+# selfhost 自用发版：只由 v<上游基线>-selfhost.<N> tag 触发。
+# 产物：linux amd64/arm64 的 GitHub release 二进制，以及 GHCR 镜像
+# ghcr.io/<owner>/nezha:<tag> 与移动 tag :selfhost（不推 latest、不推阿里云）。
+# 上游的 release.yml 在本 fork 上已停用（它会被任何 v* tag 触发）。
+name: Selfhost release
+
+on:
+  push:
+    tags:
+      - "v*-selfhost.*"
+
+# 构建会执行第三方主题的下载脚本和大量依赖代码，默认只读，
+# 发版和推镜像的 job 再各自申请需要的那一项。
+permissions:
+  contents: read
+
+concurrency:
+  group: selfhost-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-selfhost\.[1-9][0-9]*$ ]] \
+            || { echo "Tag must look like v2.7.0-selfhost.1" >&2; exit 1; }
+          git fetch --no-tags origin selfhost
+          git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD \
+            || { echo "Tagged commit is not on selfhost" >&2; exit 1; }
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite" >&2
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: true
+      matrix:
+        goarch: [amd64, arm64]
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.26
+    steps:
+      - name: Install dependencies
+        run: |
+          apt update && apt install unzip curl -y
+          # 固定版本并校验摘要：这个二进制随后就在发版构建里执行。
+          wget https://github.com/mikefarah/yq/releases/download/v4.54.3/yq_linux_amd64 -O /usr/bin/yq
+          echo "129534601871538efe0ba4c5e62a34fb1d5f469bcb975c4fddeb467d82974973  /usr/bin/yq" | sha256sum -c -
+          chmod +x /usr/bin/yq
+
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@v7.0.1
+
+      - name: Prepare frontends' dists
+        run: |
+          chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
+
+      # 没有配置 IPINFO_TOKEN 时保留仓库里的占位库继续构建（面板无法按 IP 识别国家）。
+      - name: Fetch IPInfo GeoIP Database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          if [ -z "$IPINFO_TOKEN" ]; then
+            echo "::warning::IPINFO_TOKEN is not set; building with the placeholder GeoIP database"
+            exit 0
+          fi
+          wget -qO /tmp/geoip.db "https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN}"
+          test -s /tmp/geoip.db
+          mv /tmp/geoip.db pkg/geoip/geoip.db
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "^1.26.6"
+
+      - name: generate swagger docs
+        run: |
+          go install github.com/swaggo/swag/cmd/swag@v1.16.6
+          swag init --pd -d cmd/dashboard -g main.go -o cmd/dashboard/docs
+          go mod tidy
+
+      - name: Build with tag
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-linux-${{ matrix.goarch }}
+          path: |
+            ./dist/*/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Release
+    permissions:
+      contents: write # 创建 release、上传产物
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./assets
+
+      - name: Archive and compress binaries
+        run: |
+          find assets/*/*/* -type f | while read -r file; do
+            dir=$(dirname "$file")
+            filename=$(basename "$file")
+            fileWithoutExt="${filename%.*}"
+            zip -jr "$dir/$fileWithoutExt.zip" "$file"
+          done
+          sha256sum assets/*/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
+
+      # 正式版、设为 latest。
+      - name: Release
+        run: |
+          gh release create "$RELEASE_TAG" assets/*/*/*.zip checksums.txt --verify-tag \
+            --title "$RELEASE_TAG" --generate-notes --latest --prerelease=false
+
+  release-docker:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Release Docker images
+    permissions:
+      contents: read
+      packages: write # 推送 GHCR 镜像
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./assets
+
+      - name: Fix permissions
+        run: |
+          chmod -R +x ./assets/*
+          mkdir dist
+          mv ./assets/*/*/* ./dist
+
+      - name: Set up image name
+        id: image-name
+        run: |
+          GHCR_IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/nezha" | tr '[:upper:]' '[:lower:]')
+          echo "GHCR_IMAGE_NAME=$GHCR_IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Log into GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build dashboard image and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          tags: |
+            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:selfhost
