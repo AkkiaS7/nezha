@@ -5,10 +5,12 @@ on:
     branches:
       - master
       - selfhost
+      - integration
   pull_request:
     branches:
       - master
       - selfhost
+      - integration
   merge_group:
 
 permissions:
