@@ -775,3 +775,139 @@ func TestSQLiteURI(t *testing.T) {
 	assert.Equal(t, "file:///dashboard/data/sqlite.db?mode=rw", sqliteURIFromSlash("/dashboard/data/sqlite.db", "rw"))
 	assert.Equal(t, "file:///data/a%20b%3Fc.db?mode=ro", sqliteURIFromSlash("/data/a b?c.db", "ro"))
 }
+
+// Restoring a backup made by an older version is allowed with an
+// informational warning; a version that cannot be compared (dev builds)
+// gives a warning as well.
+func TestOlderAndUnknownBackupVersions(t *testing.T) {
+	e := newTestEnv(t)
+	e.configure()
+	b := e.backup(TriggerManual) // made by v1.2.3
+	for version, warning := range map[string]string{"v1.3.0": WarnOlderVersion, "debug": WarnVersionUnknown} {
+		e.advance(rateWindow)
+		m := e.newManager(version)
+		res, err := m.Prepare(context.Background(), PrepareRequest{Name: b.Name, SHA256: b.SHA256, Password: testPassword, Actor: admin})
+		require.NoError(t, err)
+		assert.True(t, res.CanApply, version)
+		assert.Contains(t, warningCodes(res), warning, version)
+	}
+}
+
+// A backup written by a future format version is refused before anything
+// is decrypted or staged; so is a file without the format magic.
+func TestUnknownBackupFormatIsRefused(t *testing.T) {
+	e := newTestEnv(t)
+	e.configure()
+	b := e.backup(TriggerManual)
+	data := e.store.objects[DefaultPrefix+b.Name+FileExt].data
+	h, err := ReadHeader(bytes.NewReader(data))
+	require.NoError(t, err)
+	hdrLen := int(data[len(fileMagic)])<<24 | int(data[len(fileMagic)+1])<<16 | int(data[len(fileMagic)+2])<<8 | int(data[len(fileMagic)+3])
+	rest := data[len(fileMagic)+4+hdrLen:]
+
+	h.Format = 2
+	raw, err := json.Marshal(h)
+	require.NoError(t, err)
+	var future bytes.Buffer
+	future.WriteString(fileMagic)
+	future.Write([]byte{byte(len(raw) >> 24), byte(len(raw) >> 16), byte(len(raw) >> 8), byte(len(raw))})
+	future.Write(raw)
+	future.Write(rest)
+	_, err = e.prepareUpload(future.Bytes())
+	require.ErrorIs(t, err, ErrUnsupported)
+
+	e.advance(rateWindow)
+	_, err = e.prepareUpload(append([]byte("NZBAK2\n"), data[len(fileMagic):]...))
+	require.ErrorIs(t, err, ErrNotBackup)
+	entries, _ := os.ReadDir(filepath.Join(e.dir, pendingDirName))
+	assert.Empty(t, entries, "nothing is staged")
+}
+
+// Versions compare by their core X.Y.Z; suffixes such as -selfhost.N and
+// -int.<sha> do not order reliably and only ask for an acknowledgement.
+func TestVersionCheckByCoreVersion(t *testing.T) {
+	type want struct {
+		ok   bool
+		warn string
+		ack  bool
+	}
+	cases := []struct {
+		backup, panel string
+		want          want
+	}{
+		{"2.7.0", "2.7.0", want{true, "", false}},
+		{"2.6.0", "2.7.0", want{true, WarnOlderVersion, false}},
+		{"2.8.0", "2.7.0", want{false, "", false}},
+		{"2.8.0-selfhost.1-int.aaaa", "2.7.0-selfhost.3", want{false, "", false}},
+		{"2.7.0-selfhost.1", "2.8.0", want{true, WarnOlderVersion, false}},
+		// same core, different builds: allowed after acknowledgement
+		{"2.7.0", "2.7.0-selfhost.1", want{true, WarnVersionDiffers, true}},
+		{"2.7.0-selfhost.1", "2.7.0", want{true, WarnVersionDiffers, true}},
+		{"2.7.0-selfhost.2", "2.7.0-selfhost.1", want{true, WarnVersionDiffers, true}},
+		{"2.7.0-selfhost.1-int.bbbb2222", "2.7.0-selfhost.1", want{true, WarnVersionDiffers, true}},
+		{"2.7.0-selfhost.1-int.bbbb2222", "2.7.0-selfhost.1-int.aaaa1111", want{true, WarnVersionDiffers, true}},
+		{"v2.7.0-selfhost.1", "2.7.0-selfhost.1", want{true, "", false}},
+		// builds that differ only in +build metadata are different builds
+		{"2.7.0+build-a", "2.7.0+build-b", want{true, WarnVersionDiffers, true}},
+		{"2.7.0-selfhost.1+a", "2.7.0-selfhost.1", want{true, WarnVersionDiffers, true}},
+		{"2.7.0+build-a", "2.7.0+build-a", want{true, "", false}},
+		{"2.8.0+x", "2.7.0+x", want{false, "", false}},
+		// development builds cannot be compared
+		{"debug", "2.7.0", want{true, WarnVersionUnknown, true}},
+		{"2.8.0", "debug", want{true, WarnVersionUnknown, true}},
+	}
+	for _, c := range cases {
+		m := &Manager{opts: Options{Version: c.panel}}
+		check, w := m.versionCheck(c.backup)
+		got := want{ok: check.OK}
+		if w != nil {
+			got.warn, got.ack = w.Code, w.RequireAck
+		}
+		assert.Equal(t, c.want, got, "backup %s on %s", c.backup, c.panel)
+	}
+}
+
+// A backup taken by one integration build restores on a later build of the
+// same release whatever the commit hashes, once the difference is
+// acknowledged.
+func TestRestoreAcrossBuildsOfTheSameRelease(t *testing.T) {
+	e := newTestEnv(t)
+	e.m = e.newManager("2.7.0-selfhost.1-int.bbbb2222")
+	e.configure()
+	b := e.backup(TriggerSchedule)
+	e.m = e.newManager("2.7.0-selfhost.1-int.aaaa1111")
+	res, err := e.prepare(b, testPassword)
+	require.NoError(t, err)
+	require.True(t, res.CanApply)
+	assert.Contains(t, warningCodes(res), WarnVersionDiffers)
+	err = e.m.Apply(context.Background(), ApplyRequest{Token: res.RestoreToken, Password: testPassword, Confirm: ConfirmWord(res.Name), Reauth: okReauth, Actor: admin})
+	require.ErrorIs(t, err, ErrAckRequired, "the different build must be acknowledged")
+	require.NoError(t, e.apply(res, testPassword))
+}
+
+// backup.yaml written by a newer version (higher format) turns the feature
+// off and is left untouched; a file without the field is format 1 and is
+// written back with it.
+func TestSettingsFormatVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, SettingsFileName)
+	future := []byte("format: 2\nschedule:\n  enabled: true\n  cron: 0 0 3 * * *\n  retention: 7\nnew_field: kept\n")
+	require.NoError(t, os.WriteFile(path, future, 0600))
+	_, err := NewManager(Options{DataDir: dir, ConfigPath: filepath.Join(dir, "config.yaml")})
+	require.ErrorIs(t, err, ErrSettingsFormat)
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, string(future), string(got), "the newer file is not rewritten")
+
+	require.NoError(t, os.WriteFile(path, []byte("schedule:\n  retention: 5\n"), 0600))
+	m, err := NewManager(Options{DataDir: dir, ConfigPath: filepath.Join(dir, "config.yaml")})
+	require.NoError(t, err)
+	defer m.Close()
+	assert.Equal(t, 5, m.View().Schedule.Retention)
+	keep := 6
+	_, err = m.UpdateConfig(ConfigUpdate{Schedule: &ScheduleUpdate{Retention: &keep}}, admin)
+	require.NoError(t, err)
+	got, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "format: 1")
+}
