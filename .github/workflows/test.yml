@@ -27,6 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # selfhost CI trim: pushes to selfhost/integration only repeat the ubuntu leg;
+        # the full matrix already ran on the pull request that produced the commit.
+        exclude:
+          - os: ${{ github.event_name == 'push' && 'windows-latest' || 'none' }}
+          - os: ${{ github.event_name == 'push' && 'macos-latest' || 'none' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -53,6 +58,8 @@ jobs:
 
   linux-race-quality:
     name: Linux race and quality
+    # selfhost CI trim: required checks are evaluated on pull requests only.
+    if: github.event_name != 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -94,6 +101,8 @@ jobs:
 
   agentcompat-stress:
     name: Linux agent compatibility stress
+    # selfhost CI trim: required checks are evaluated on pull requests only.
+    if: github.event_name != 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
@@ -142,6 +151,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require all blocking jobs to pass
+        # selfhost CI trim: on push the race and stress jobs are skipped on purpose.
+        if: github.event_name != 'push'
         shell: bash
         run: |
           test "${{ needs.tests.result }}" = success
