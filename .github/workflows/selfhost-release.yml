@@ -1,6 +1,7 @@
 # selfhost 自用发版：只由 v<上游基线>-selfhost.<N> tag 触发。
-# 产物：linux amd64/arm64 的 GitHub release 二进制，以及 GHCR 镜像
-# ghcr.io/<owner>/nezha:<tag> 与移动 tag :selfhost（不推 latest、不推阿里云）。
+# 产物：linux amd64/arm64 的 GitHub release 二进制，以及 GHCR 镜像 ghcr.io/<owner>/nezha:<tag>
+# （不推 latest、不推阿里云，也不推移动 tag：线上按验证过的 digest 固定）。
+# release 先以 prerelease 发布，在集成测试环境安装并冒烟通过后，再用同一份产物晋级为正式版，不重新构建。
 # 上游的 release.yml 在本 fork 上已停用（它会被任何 v* tag 触发）。
 name: Selfhost release
 
@@ -140,11 +141,11 @@ jobs:
           done
           sha256sum assets/*/*/*.zip | awk -F" |/" '{print $1, $NF}' > checksums.txt
 
-      # 正式版、设为 latest。
+      # 先发 prerelease：集成测试环境验证通过后再晋级为正式版并设为 latest（不重新构建）。
       - name: Release
         run: |
           gh release create "$RELEASE_TAG" assets/*/*/*.zip checksums.txt --verify-tag \
-            --title "$RELEASE_TAG" --generate-notes --latest --prerelease=false
+            --title "$RELEASE_TAG" --generate-notes --prerelease --latest=false
 
   release-docker:
     runs-on: ubuntu-latest
@@ -200,4 +201,3 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
           tags: |
             ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:selfhost
