@@ -218,6 +218,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/online-user/batch-block", restScopeMiddleware(model.ScopeAdminAll), adminHandler(batchBlockOnlineUser))
 	auth.PATCH("/setting", restScopeMiddleware(model.ScopeAdminAll), adminHandler(updateConfig))
 	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(runMaintenance))
+	auth.GET("/database/usage", restScopeMiddleware(model.ScopeAdminAll), adminHandler(getDatabaseUsage))
+	auth.POST("/database/history-cleanup", restScopeMiddleware(model.ScopeAdminAll), adminHandler(startHistoryCleanup))
 	registerFrontendRoutes(auth)
 	registerBackupRoutes(auth, patForbidden)
 

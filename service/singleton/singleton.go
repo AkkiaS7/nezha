@@ -296,7 +296,14 @@ func CleanMonitorHistory() {
 }
 
 // PerformMaintenance 执行系统维护（SQLite VACUUM 和 TSDB 维护）
-func PerformMaintenance() {
+// It returns ErrDatabaseBusy without doing anything while a service history
+// cleanup or another maintenance is running.
+func PerformMaintenance() error {
+	if !dbMaintenanceMu.TryLock() {
+		log.Println("NEZHA>> System maintenance skipped: another database maintenance is in progress")
+		return ErrDatabaseBusy
+	}
+	defer dbMaintenanceMu.Unlock()
 	log.Println("NEZHA>> Starting system maintenance...")
 
 	// 1. SQLite 维护
@@ -315,6 +322,7 @@ func PerformMaintenance() {
 	}
 
 	log.Println("NEZHA>> System maintenance completed")
+	return nil
 }
 
 // IPDesensitize 根据设置选择是否对IP进行打码处理 返回处理后的IP(关闭打码则返回原IP)

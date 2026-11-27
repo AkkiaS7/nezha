@@ -702,6 +702,12 @@ func (m *Manager) checkRestarting() error {
 	return nil
 }
 
+// Restarting reports whether the dashboard is shutting down to apply a
+// restore. Other features that rewrite the database refuse to start then.
+func (m *Manager) Restarting() bool {
+	return m.checkRestarting() != nil
+}
+
 // StartBackup starts a backup in the background and returns its running entry.
 func (m *Manager) StartBackup(trigger Trigger, actor Actor) (BackupInfo, error) {
 	if err := m.checkRestarting(); err != nil {
