@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/nezhahq/nezha/model"
-	"github.com/nezhahq/nezha/pkg/backup"
 )
 
 var (
@@ -37,8 +36,10 @@ var historyCleanupPause = 50 * time.Millisecond
 var diskFreeFunc = diskFree
 
 // dbMaintenanceMu is held by the operations that rewrite large parts of the
-// database: the history cleanup and VACUUM (PerformMaintenance). It is only
-// taken with TryLock, so a request never waits behind a long-running one.
+// database: the history cleanup, VACUUM (PerformMaintenance) and applying a
+// restore (backup.Options.DatabaseLock, from the pre-restore backup until the
+// restart). It is only taken with TryLock, so a request never waits behind a
+// long-running one.
 var dbMaintenanceMu sync.Mutex
 
 var (
@@ -46,17 +47,66 @@ var (
 	historyJob   = model.HistoryCleanupJob{State: model.HistoryCleanupIdle}
 )
 
-// historyCleanupCondition selects the rows a cleanup with the given cutoffs
-// removes: per-server ping rows older than the retention, 15-minute summaries
-// older than max(retention, 30 days), and the rows of deleted services.
+// historyOlderThan matches rows created before an instant, given as the two
+// arguments of historyBound.args.
 //
-// created_at is stored as text with the writer's UTC offset, and the cutoffs
-// are bound the same way (time.Now() in the process time zone), so the text
-// comparison matches the time comparison and can use the created_at index.
-const historyCleanupCondition = "(server_id != 0 AND created_at < ?) OR (server_id = 0 AND created_at < ?) OR service_id NOT IN (SELECT id FROM services)"
+// created_at is text holding the writer's local time and UTC offset, and the
+// offset changes with the process time zone (a moved or restored database, a
+// changed TZ), so comparing the text does not compare instants. julianday()
+// reads the offset and compares instants; the text range in front of it only
+// narrows the rows it has to look at through the created_at index: a local
+// time is at most 14 hours (the largest UTC offset) ahead of UTC, so no row
+// created before the instant sorts after the instant's UTC time plus 14 hours.
+// A created_at that julianday() cannot read is never matched.
+const historyOlderThan = "created_at < ? AND julianday(created_at) < julianday(?)"
 
-func historyCutoffs(now time.Time, days int) (time.Time, time.Time) {
-	return now.AddDate(0, 0, -days), now.AddDate(0, 0, -max(days, model.HistorySummaryMinRetentionDays))
+const historyMaxUTCOffset = 14 * time.Hour
+
+type historyBound struct {
+	textUpper string // UTC wall time + max offset, for the index range
+	instant   string // UTC wall time without offset, which julianday() reads as UTC
+}
+
+func newHistoryBound(t time.Time) historyBound {
+	u := t.UTC()
+	return historyBound{
+		textUpper: u.Add(historyMaxUTCOffset + time.Minute).Format("2006-01-02 15:04:05"),
+		instant:   u.Format("2006-01-02 15:04:05.000"),
+	}
+}
+
+func (b historyBound) args() []any { return []any{b.textUpper, b.instant} }
+
+// historyCleanupSteps are the deletes of a cleanup, in order: per-server ping
+// rows older than the retention, 15-minute summaries older than
+// max(retention, 30 days), and the rows of deleted services.
+func historyCleanupSteps(now time.Time, days int) []historyCleanupStep {
+	cut := newHistoryBound(now.AddDate(0, 0, -days))
+	summaryCut := newHistoryBound(now.AddDate(0, 0, -max(days, model.HistorySummaryMinRetentionDays)))
+	return []historyCleanupStep{
+		{"server_id != 0 AND " + historyOlderThan, cut.args()},
+		{"server_id = 0 AND " + historyOlderThan, summaryCut.args()},
+		{"service_id NOT IN (SELECT id FROM services)", nil},
+	}
+}
+
+type historyCleanupStep struct {
+	cond string
+	args []any
+}
+
+// historyCleanupCondition matches every row the steps delete, for the estimate.
+func historyCleanupCondition(steps []historyCleanupStep) (string, []any) {
+	var cond string
+	var args []any
+	for i, step := range steps {
+		if i > 0 {
+			cond += " OR "
+		}
+		cond += "(" + step.cond + ")"
+		args = append(args, step.args...)
+	}
+	return cond, args
 }
 
 // ValidHistoryRetentionDays reports whether days is an accepted retention.
@@ -177,10 +227,13 @@ func GetDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUs
 // 10%, slightly high because pages are not full.
 func estimateHistoryCleanup(ctx context.Context, days int, st dbFileStats, total int64) (*model.HistoryCleanupEstimate, error) {
 	e := &model.HistoryCleanupEstimate{RetentionDays: days}
-	cut, summaryCut := historyCutoffs(time.Now(), days)
+	now := time.Now()
+	cond, args := historyCleanupCondition(historyCleanupSteps(now, days))
 	countCtx, cancel := context.WithTimeout(ctx, historyEstimateTimeout)
+	// The orphan condition makes this one scan of the composite index, which
+	// holds every column it reads.
 	err := DB.WithContext(countCtx).Model(&model.ServiceHistory{}).
-		Where(historyCleanupCondition, cut, summaryCut).Count(&e.DeletableRows).Error
+		Where(cond, args...).Count(&e.DeletableRows).Error
 	cancel()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -189,7 +242,7 @@ func estimateHistoryCleanup(ctx context.Context, days int, st dbFileStats, total
 		// The count scans the deleted rows; on a slow disk fall back to
 		// the ids, which grow with created_at, around the cutoff.
 		log.Printf("NEZHA>> service history estimate: exact count failed, approximating: %v", err)
-		e.DeletableRows, err = approximateDeletableRows(ctx, cut, total)
+		e.DeletableRows, err = approximateDeletableRows(ctx, now.AddDate(0, 0, -days), total)
 		if err != nil {
 			return nil, err
 		}
@@ -206,6 +259,9 @@ func estimateHistoryCleanup(ctx context.Context, days int, st dbFileStats, total
 	return e, nil
 }
 
+// approximateDeletableRows counts the ids before the first row kept by
+// created_at order. It ignores the summaries' longer retention and compares
+// created_at as text, so it is only a fallback for the estimate.
 func approximateDeletableRows(ctx context.Context, cut time.Time, total int64) (int64, error) {
 	db := DB.WithContext(ctx)
 	var minID, firstKept sql.NullInt64
@@ -247,10 +303,6 @@ func StartHistoryCleanup(retentionDays int, vacuum bool) (model.HistoryCleanupJo
 	if !serviceHistoryAvailable() {
 		return model.HistoryCleanupJob{}, ErrServiceHistoryUnavailable
 	}
-	// A restore is applied by restarting; the database is about to be replaced.
-	if BackupShared != nil && BackupShared.Restarting() {
-		return model.HistoryCleanupJob{}, backup.ErrRestarting
-	}
 	if !dbMaintenanceMu.TryLock() {
 		return model.HistoryCleanupJob{}, ErrDatabaseBusy
 	}
@@ -285,15 +337,7 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 		fail(err)
 		return
 	}
-	cut, summaryCut := historyCutoffs(time.Now(), job.RetentionDays)
-	for _, step := range []struct {
-		cond string
-		args []any
-	}{
-		{"server_id != 0 AND created_at < ?", []any{cut}},
-		{"server_id = 0 AND created_at < ?", []any{summaryCut}},
-		{"service_id NOT IN (SELECT id FROM services)", nil},
-	} {
+	for _, step := range historyCleanupSteps(time.Now(), job.RetentionDays) {
 		query := "DELETE FROM service_histories WHERE id IN (SELECT id FROM service_histories WHERE " + step.cond + " LIMIT ?)"
 		args := append(step.args, historyCleanupBatchSize)
 		for {

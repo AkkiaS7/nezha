@@ -238,3 +238,81 @@ func TestApproximateDeletableRows(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(10), n)
 }
+
+// created_at keeps the writer's UTC offset, which changes with the process
+// time zone. Rows on both sides of each cutoff, written with offsets whose
+// text sorts the other way, must be judged by the instant.
+func TestHistoryCleanupComparesInstantsAcrossUTCOffsets(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	service := &model.Service{Name: "kept", Type: model.TaskTypeTCPPing, Target: "192.0.2.1:80"}
+	require.NoError(t, DB.Create(service).Error)
+	east := time.FixedZone("UTC+14", 14*3600)
+	west := time.FixedZone("UTC-12", -12*3600)
+	now := time.Now()
+	pingCut := now.AddDate(0, 0, -7)
+	summaryCut := now.AddDate(0, 0, -30)
+	type row struct {
+		serverID uint64
+		at       time.Time
+		kept     bool
+	}
+	rows := []row{
+		// The text of these sorts before the cutoff, yet they are newer.
+		{1, pingCut.Add(30 * time.Minute).In(west), true},
+		{0, summaryCut.Add(30 * time.Minute).In(west), true},
+		// The text of these sorts after the cutoff, yet they are older.
+		{1, pingCut.Add(-30 * time.Minute).In(east), false},
+		{0, summaryCut.Add(-30 * time.Minute).In(east), false},
+		// Same offset on both sides.
+		{1, pingCut.Add(30 * time.Minute).In(east), true},
+		{1, pingCut.Add(-30 * time.Minute).In(west), false},
+		{0, summaryCut.Add(30 * time.Minute).In(east), true},
+		{0, summaryCut.Add(-30 * time.Minute).In(west), false},
+	}
+	for _, r := range rows {
+		require.NoError(t, DB.Create(&model.ServiceHistory{ServiceID: service.ID, ServerID: r.serverID, CreatedAt: r.at}).Error)
+	}
+	var stored []string
+	require.NoError(t, DB.Raw("SELECT created_at FROM service_histories WHERE id IN (1, 3)").Scan(&stored).Error)
+	require.Len(t, stored, 2)
+	require.Contains(t, stored[0], "-12:00", "the fixture must store the writer's offset")
+	require.Contains(t, stored[1], "+14:00", "the fixture must store the writer's offset")
+
+	usage, err := GetDatabaseUsage(context.Background(), 7)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), usage.Estimate.DeletableRows)
+
+	_, err = StartHistoryCleanup(7, false)
+	require.NoError(t, err)
+	job := waitHistoryCleanup(t)
+	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
+	require.Equal(t, int64(4), job.DeletedRows)
+
+	var left []model.ServiceHistory
+	require.NoError(t, DB.Order("id").Find(&left).Error)
+	var keptIDs []uint64
+	for _, r := range left {
+		keptIDs = append(keptIDs, r.ID)
+	}
+	var want []uint64
+	for i, r := range rows {
+		if r.kept {
+			want = append(want, uint64(i+1))
+		}
+	}
+	require.Equal(t, want, keptIDs)
+}
+
+// The backup manager shares the cleanup's lock, so that a restore and a
+// cleanup exclude each other (the order of starting is tested in pkg/backup).
+func TestBackupOptionsShareDatabaseLock(t *testing.T) {
+	opts := backupOptions("config.yaml", filepath.Join(t.TempDir(), "sqlite.db"))
+	require.Same(t, &dbMaintenanceMu, opts.DatabaseLock)
+
+	newHistoryCleanupTestDB(t)
+	require.True(t, opts.DatabaseLock.TryLock()) // as Apply does
+	_, err := StartHistoryCleanup(30, true)
+	require.ErrorIs(t, err, ErrDatabaseBusy)
+	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
+	opts.DatabaseLock.Unlock()
+}

@@ -58,7 +58,7 @@ func TestServiceHistoryQueriesUseCompositeIndex(t *testing.T) {
 	newHistoryCleanupTestDB(t)
 	require.NoError(t, migrateServiceHistory())
 	now := time.Now()
-	for _, q := range []struct {
+	queries := []struct {
 		sql  string
 		args []any
 	}{
@@ -66,9 +66,18 @@ func TestServiceHistoryQueriesUseCompositeIndex(t *testing.T) {
 		{"SELECT * FROM service_histories WHERE server_id = ? AND created_at >= ? ORDER BY service_id, created_at", []any{1, now}},
 		{"SELECT * FROM service_histories WHERE created_at > ? AND created_at < ? AND server_id = 0", []any{now, now}},
 		{"SELECT * FROM service_histories WHERE created_at >= ? AND server_id = 0", []any{now}},
-		{"SELECT id FROM service_histories WHERE server_id != 0 AND created_at < ? LIMIT 5000", []any{now}},
 		{"SELECT id FROM service_histories WHERE created_at >= ? ORDER BY created_at LIMIT 1", []any{now}},
-	} {
+	}
+	// The time-bounded cleanup steps search the index; the orphan step and
+	// the estimate (which includes it) read the whole composite index.
+	steps := historyCleanupSteps(now, 7)
+	for _, step := range steps[:2] {
+		queries = append(queries, struct {
+			sql  string
+			args []any
+		}{"SELECT id FROM service_histories WHERE " + step.cond + " LIMIT 5000", step.args})
+	}
+	for _, q := range queries {
 		rows, err := DB.Raw("EXPLAIN QUERY PLAN "+q.sql, q.args...).Rows()
 		require.NoError(t, err)
 		var plan []string
@@ -79,6 +88,7 @@ func TestServiceHistoryQueriesUseCompositeIndex(t *testing.T) {
 			plan = append(plan, detail)
 		}
 		require.NoError(t, rows.Close())
+		require.Contains(t, strings.Join(plan, " | "), "SEARCH service_histories USING", q.sql)
 		require.Contains(t, strings.Join(plan, " | "), "INDEX "+compositeHistoryIndex, q.sql)
 	}
 }
