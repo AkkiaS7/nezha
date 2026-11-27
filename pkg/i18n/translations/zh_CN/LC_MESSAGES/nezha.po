@@ -313,3 +313,30 @@ msgstr "故障"
 #: service/singleton/user.go:60
 msgid "user id not specified"
 msgstr "用户 ID 未指定"
+
+#: cmd/dashboard/controller/backup.go:97
+#, c-format
+msgid "backup file exceeds the size limit (%d MiB)"
+msgstr "备份文件超过大小上限（%d MiB）"
+
+#: cmd/dashboard/controller/backup.go:98
+#, c-format
+msgid "set the environment variable %s to raise the limit"
+msgstr "可设置环境变量 %s 调高上限"
+
+#: cmd/dashboard/controller/backup.go:100
+msgid "backup file exceeds the size limit"
+msgstr "备份文件超过大小上限"
+
+#: cmd/dashboard/controller/backup.go:102
+#, c-format
+msgid "not enough free disk space in the data directory: %d MiB needed, %d MiB free"
+msgstr "数据目录所在磁盘剩余空间不足：需要 %d MiB，剩余 %d MiB"
+
+#: cmd/dashboard/controller/backup.go:110
+msgid "another backup or restore operation is in progress"
+msgstr "另一个备份或恢复操作正在进行"
+
+#: cmd/dashboard/controller/backup.go:144
+msgid "backup file is corrupt or has been modified"
+msgstr "备份文件已损坏或被修改"
