@@ -2,7 +2,7 @@
   name: "OfficialAdmin"
   repository: "https://github.com/AkkiaS7/nezha-admin-frontend"
   author: "AkkiaS7"
-  version: "v2.6.1-selfhost.3"
+  version: "v2.7.0-selfhost.1"
   is_admin: true
   is_official: true
 - path: "user-dist"
