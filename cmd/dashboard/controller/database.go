@@ -7,7 +7,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/nezhahq/nezha/model"
-	"github.com/nezhahq/nezha/pkg/backup"
 	"github.com/nezhahq/nezha/service/singleton"
 )
 
@@ -76,8 +75,6 @@ func localizeDatabaseError(err error) error {
 		return l.ErrorT("service history is not stored in the SQLite database")
 	case errors.Is(err, singleton.ErrDatabaseBusy):
 		return l.ErrorT("another database cleanup or maintenance is in progress")
-	case errors.Is(err, backup.ErrRestarting):
-		return l.ErrorT("the dashboard is restarting to apply a restore")
 	}
 	return err
 }

@@ -25,7 +25,17 @@ func InitBackup(configPath, dbDSN string) error {
 		log.Println("NEZHA>> backup: disabled, the database is not a file")
 		return nil
 	}
-	m, err := backup.NewManager(backup.Options{
+	m, err := backup.NewManager(backupOptions(configPath, dbPath))
+	if err != nil {
+		log.Printf("NEZHA>> backup: disabled: %v", err)
+		return nil
+	}
+	BackupShared = m
+	return nil
+}
+
+func backupOptions(configPath, dbPath string) backup.Options {
+	return backup.Options{
 		DataDir:    filepath.Dir(dbPath),
 		ConfigPath: configPath,
 		Version:    Version,
@@ -37,13 +47,9 @@ func InitBackup(configPath, dbDSN string) error {
 				RequestRestart()
 			}
 		},
-	})
-	if err != nil {
-		log.Printf("NEZHA>> backup: disabled: %v", err)
-		return nil
+		// A restore and the history cleanup or VACUUM exclude each other.
+		DatabaseLock: &dbMaintenanceMu,
 	}
-	BackupShared = m
-	return nil
 }
 
 // snapshotDatabase writes a consistent copy of the live database to dst.

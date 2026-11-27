@@ -104,6 +104,7 @@ func localizeBackupError(err error) error {
 		{backup.ErrStorageMissing, func() error { return l.ErrorT("backup storage is not configured") }},
 		{backup.ErrBusy, func() error { return l.ErrorT("another backup or restore operation is in progress") }},
 		{backup.ErrRestarting, func() error { return l.ErrorT("the dashboard is restarting to apply a restore") }},
+		{backup.ErrDatabaseBusy, func() error { return l.ErrorT("another database cleanup or maintenance is in progress") }},
 		{backup.ErrInvalidName, func() error { return l.ErrorT("invalid backup name") }},
 		{backup.ErrPasswordSet, func() error { return l.ErrorT("backup password is already set; change or reset it instead") }},
 		{backup.ErrPasswordNotSet, func() error { return l.ErrorT("backup password is not set") }},

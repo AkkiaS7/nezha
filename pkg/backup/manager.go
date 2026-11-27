@@ -51,6 +51,7 @@ var (
 	ErrNotConfigured     = errors.New("backup storage and password must be configured first")
 	ErrStorageMissing    = errors.New("backup storage is not configured")
 	ErrBusy              = errors.New("another backup or restore operation is in progress")
+	ErrDatabaseBusy      = errors.New("a database cleanup or maintenance is in progress")
 	ErrRestarting        = errors.New("the dashboard is restarting to apply a restore")
 	ErrInvalidName       = errors.New("invalid backup name")
 	ErrPasswordSet       = errors.New("backup password is already set; change or reset it instead")
@@ -98,6 +99,17 @@ type Options struct {
 	AllowLoopbackHTTP bool
 	// RetryDelay is the base delay between upload attempts.
 	RetryDelay time.Duration
+	// DatabaseLock, when set, is shared with other operations that rewrite
+	// the database (cleanup, VACUUM). Apply takes it with TryLock before the
+	// pre-restore backup and keeps it through the restart, so none of them
+	// runs while a restore is applied, and a restore is refused while one runs.
+	DatabaseLock TryLocker
+}
+
+// TryLocker is implemented by *sync.Mutex.
+type TryLocker interface {
+	TryLock() bool
+	Unlock()
 }
 
 // Manager runs backups and restores.
@@ -700,12 +712,6 @@ func (m *Manager) checkRestarting() error {
 		return ErrRestarting
 	}
 	return nil
-}
-
-// Restarting reports whether the dashboard is shutting down to apply a
-// restore. Other features that rewrite the database refuse to start then.
-func (m *Manager) Restarting() bool {
-	return m.checkRestarting() != nil
 }
 
 // StartBackup starts a backup in the background and returns its running entry.
