@@ -7,14 +7,13 @@ import (
 )
 
 // LegacyServiceHistoryCreatedAtIndex is the single-column created_at index
-// of earlier releases, dropped on migration.
+// of earlier releases, dropped on migration: created_at leads
+// idx_server_id_created_at_service_id_avg_delay (GORM orders its columns by
+// field order), which serves every created_at range query.
 const LegacyServiceHistoryCreatedAtIndex = "idx_service_histories_created_at"
 
 type ServiceHistory struct {
 	ID        uint64    `gorm:"primaryKey" json:"id,omitempty"`
-	// created_at leads idx_server_id_created_at_service_id_avg_delay (GORM
-	// orders its columns by field order), which serves every created_at range
-	// query; the former single-column index duplicated it.
 	CreatedAt time.Time `gorm:"<-:create;index:idx_server_id_created_at_service_id_avg_delay" json:"created_at,omitempty"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at,omitempty"`
 	ServiceID uint64    `gorm:"index:idx_server_id_created_at_service_id_avg_delay" json:"service_id,omitempty"`
