@@ -51,6 +51,7 @@ var (
 	ErrNotConfigured     = errors.New("backup storage and password must be configured first")
 	ErrStorageMissing    = errors.New("backup storage is not configured")
 	ErrBusy              = errors.New("another backup or restore operation is in progress")
+	ErrDatabaseBusy      = errors.New("a database cleanup or maintenance is in progress")
 	ErrRestarting        = errors.New("the dashboard is restarting to apply a restore")
 	ErrInvalidName       = errors.New("invalid backup name")
 	ErrPasswordSet       = errors.New("backup password is already set; change or reset it instead")
@@ -104,6 +105,17 @@ type Options struct {
 	// DiskFree returns the bytes available on the file system of a
 	// directory (tests replace it).
 	DiskFree func(dir string) (int64, error)
+	// DatabaseLock, when set, is shared with other operations that rewrite
+	// the database (cleanup, VACUUM). Apply takes it with TryLock before the
+	// pre-restore backup and keeps it through the restart, so none of them
+	// runs while a restore is applied, and a restore is refused while one runs.
+	DatabaseLock TryLocker
+}
+
+// TryLocker is implemented by *sync.Mutex.
+type TryLocker interface {
+	TryLock() bool
+	Unlock()
 }
 
 // Manager runs backups and restores.
