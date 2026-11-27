@@ -26,12 +26,14 @@ func InitBackup(configPath, dbDSN string) error {
 		return nil
 	}
 	m, err := backup.NewManager(backup.Options{
-		DataDir:    filepath.Dir(dbPath),
-		ConfigPath: configPath,
-		Version:    Version,
-		Snapshot:   snapshotDatabase,
-		CronParser: newCronSpecParser(),
-		Location:   Loc,
+		DataDir:        filepath.Dir(dbPath),
+		DatabasePath:   dbPath,
+		ConfigPath:     configPath,
+		Version:        Version,
+		Snapshot:       snapshotDatabase,
+		CronParser:     newCronSpecParser(),
+		Location:       Loc,
+		MaxBackupBytes: backup.MaxBytesFromEnv(),
 		Restart: func() {
 			if RequestRestart != nil {
 				RequestRestart()

@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/backup"
+	"github.com/nezhahq/nezha/pkg/i18n"
 	"github.com/nezhahq/nezha/pkg/idcodec"
 	"github.com/nezhahq/nezha/service/singleton"
 )
@@ -187,6 +190,9 @@ func (env *backupTestEnv) as(c backupCaller, method, path string, body any) *htt
 	case nil:
 	case *multipartBody:
 		reader, contentType = bytes.NewReader(b.data), b.contentType
+		if b.unknownLength {
+			reader = struct{ io.Reader }{reader}
+		}
 	default:
 		data, _ := json.Marshal(b)
 		reader = bytes.NewReader(data)
@@ -215,6 +221,9 @@ func (env *backupTestEnv) adminCaller() backupCaller {
 type multipartBody struct {
 	data        []byte
 	contentType string
+	// unknownLength sends the body without a Content-Length (as a chunked
+	// upload does).
+	unknownLength bool
 }
 
 func newMultipart(t *testing.T, fields map[string]string, file []byte) *multipartBody {
@@ -385,6 +394,107 @@ func TestBackupUploadBodyLimit(t *testing.T) {
 
 	rec = env.as(env.adminCaller(), "PATCH", "/api/v1/backup/config", map[string]any{"s3": map[string]any{"prefix": strings.Repeat("a", 2<<20)}})
 	assert.False(t, decodeResponse[any](t, rec).Success)
+}
+
+// An upload is refused before its body is streamed when the data directory
+// cannot hold it, and the size limit error names the variable that raises it.
+func TestBackupUploadChecksDiskSpaceAndNamesTheLimit(t *testing.T) {
+	env := newBackupTestEnv(t)
+	opts := env.managerOptions()
+	opts.DiskFree = func(string) (int64, error) { return 1 << 20, nil }
+	m, err := backup.NewManager(opts)
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+	singleton.BackupShared = m
+
+	rec := env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", newMultipart(t, map[string]string{"password": mockBackupPassword}, []byte("data")))
+	resp := decodeResponse[any](t, rec)
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "not enough free disk space")
+	assertNoUploadLeft(t, env.dir)
+
+	msg := localizeBackupError(fmt.Errorf("x: %w", backup.ErrTooLarge)).Error()
+	assert.Contains(t, msg, fmt.Sprintf("(%d MiB)", backup.DefaultMaxBackupBytes>>20))
+	assert.Contains(t, msg, backup.EnvMaxSizeMB)
+}
+
+func assertNoUploadLeft(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, ".backup-tmp"))
+	if err == nil {
+		assert.Empty(t, entries, "nothing of the upload was left behind")
+	}
+}
+
+// An upload without a Content-Length is held to the disk budget while it
+// is written, and a second upload is refused while one is being received
+// and checked, so uploads cannot together use up the space kept free.
+func TestBackupUploadDiskBudgetWithoutLengthAndConcurrent(t *testing.T) {
+	env := newBackupTestEnv(t)
+	opts := env.managerOptions()
+	const reserve = 256 << 20
+	opts.DiskFree = func(string) (int64, error) { return reserve + 4<<20, nil } // room for 4 MiB only
+	m, err := backup.NewManager(opts)
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+	singleton.BackupShared = m
+
+	body := newMultipart(t, map[string]string{"password": mockBackupPassword}, bytes.Repeat([]byte("x"), 16<<20))
+	body.unknownLength = true
+	rec := env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", body)
+	resp := decodeResponse[any](t, rec)
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "not enough free disk space")
+	assertNoUploadLeft(t, env.dir)
+
+	release, err := m.AcquireUpload()
+	require.NoError(t, err)
+	small := newMultipart(t, map[string]string{"password": mockBackupPassword}, []byte("data"))
+	resp = decodeResponse[any](t, env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", small))
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "another backup or restore operation is in progress")
+	release()
+	resp = decodeResponse[any](t, env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", small))
+	assert.Contains(t, resp.Error, "not a nezha backup file", "the slot is free again once the upload was checked")
+}
+
+// The upload precheck and a failed unpack report in the administrator's
+// language; the check code of the unpack failure stays "payload".
+func TestBackupSizeAndSpaceMessagesAreTranslated(t *testing.T) {
+	env := newBackupTestEnv(t)
+	env.configure(t)
+	b := env.createBackup(t)
+
+	old := singleton.Localizer
+	singleton.Localizer = i18n.NewLocalizer("zh_CN", "nezha", "translations", i18n.Translations)
+	t.Cleanup(func() { singleton.Localizer = old })
+
+	// A limit between the size of the file and its unpacked size.
+	opts := env.managerOptions()
+	opts.MaxBackupBytes = b.Size + 1
+	m, err := backup.NewManager(opts)
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+	singleton.BackupShared = m
+	rec := env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", map[string]any{"name": b.Name, "sha256": b.SHA256, "password": mockBackupPassword})
+	prep := decodeResponse[RestorePrepareResponse](t, rec)
+	require.True(t, prep.Success, rec.Body.String())
+	require.False(t, prep.Data.CanApply)
+	last := prep.Data.Checks[len(prep.Data.Checks)-1]
+	assert.Equal(t, backup.CheckPayload, last.Code)
+	assert.Equal(t, "备份文件超过大小上限（0 MiB）; 可设置环境变量 NZ_BACKUP_MAX_SIZE_MB 调高上限", last.Message)
+
+	// The upload precheck when the disk is full.
+	opts = env.managerOptions()
+	opts.DiskFree = func(string) (int64, error) { return 300 << 20, nil }
+	m, err = backup.NewManager(opts)
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+	singleton.BackupShared = m
+	body := newMultipart(t, map[string]string{"password": mockBackupPassword}, bytes.Repeat([]byte("x"), 64<<20))
+	resp := decodeResponse[any](t, env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", body))
+	assert.False(t, resp.Success)
+	assert.Equal(t, "数据目录所在磁盘剩余空间不足：需要 320 MiB，剩余 300 MiB", resp.Error)
 }
 
 // An administrator without a usable password (OAuth only) must have signed

@@ -310,3 +310,30 @@ msgstr ""
 #: service/singleton/user.go:60
 msgid "user id not specified"
 msgstr ""
+
+#: cmd/dashboard/controller/backup.go:97
+#, c-format
+msgid "backup file exceeds the size limit (%d MiB)"
+msgstr ""
+
+#: cmd/dashboard/controller/backup.go:98
+#, c-format
+msgid "set the environment variable %s to raise the limit"
+msgstr ""
+
+#: cmd/dashboard/controller/backup.go:100
+msgid "backup file exceeds the size limit"
+msgstr ""
+
+#: cmd/dashboard/controller/backup.go:102
+#, c-format
+msgid "not enough free disk space in the data directory: %d MiB needed, %d MiB free"
+msgstr ""
+
+#: cmd/dashboard/controller/backup.go:110
+msgid "another backup or restore operation is in progress"
+msgstr ""
+
+#: cmd/dashboard/controller/backup.go:144
+msgid "backup file is corrupt or has been modified"
+msgstr ""
