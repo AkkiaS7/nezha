@@ -17,14 +17,9 @@ import (
 	"github.com/nezhahq/nezha/service/singleton"
 )
 
-// Every user-facing backup error goes through the gettext catalogue with its
-// English text as msgid, so untranslated languages read exactly as before.
-func TestBackupErrorsAreLocalized(t *testing.T) {
-	old := singleton.Localizer
-	singleton.Localizer = i18n.NewLocalizer("en_US", "nezha", "translations", i18n.Translations)
-	t.Cleanup(func() { singleton.Localizer = old })
-
-	same := []error{
+// backupSentinelErrors are the backup errors whose message is a fixed msgid.
+func backupSentinelErrors() []error {
+	return []error{
 		backup.ErrNotConfigured, backup.ErrStorageMissing, backup.ErrBusy, backup.ErrRestarting, backup.ErrInvalidName,
 		backup.ErrPasswordSet, backup.ErrPasswordNotSet, backup.ErrResetConfirm, backup.ErrSecretRequired,
 		backup.ErrInvalidBucketName, backup.ErrRegionTooLong, backup.ErrInvalidPrefix,
@@ -35,6 +30,16 @@ func TestBackupErrorsAreLocalized(t *testing.T) {
 		backup.ErrUnsupported, backup.ErrCorrupt, backup.ErrNotFound, backup.ErrPreRestore,
 		errBackupUnavailable, errLoginPasswordNeed, errLoginPasswordWrong, errReauthNeeded, errUploadMultiple, errUploadMissing, backup.ErrReauthRequired,
 	}
+}
+
+// Every user-facing backup error goes through the gettext catalogue with its
+// English text as msgid, so untranslated languages read exactly as before.
+func TestBackupErrorsAreLocalized(t *testing.T) {
+	old := singleton.Localizer
+	singleton.Localizer = i18n.NewLocalizer("en_US", "nezha", "translations", i18n.Translations)
+	t.Cleanup(func() { singleton.Localizer = old })
+
+	same := backupSentinelErrors()
 	for _, e := range same {
 		got := localizeBackupError(fmt.Errorf("context: %w", e))
 		require.Error(t, got)
@@ -58,6 +63,41 @@ func TestBackupErrorsAreLocalized(t *testing.T) {
 	assert.Equal(t, errNoop, localizeBackupError(errNoop))
 	other := errors.New("unrelated")
 	assert.Equal(t, other, localizeBackupError(other))
+}
+
+// Simplified and Traditional Chinese translate every backup error message.
+func TestBackupErrorsHaveChineseTranslations(t *testing.T) {
+	old := singleton.Localizer
+	t.Cleanup(func() { singleton.Localizer = old })
+
+	errs := append(backupSentinelErrors(),
+		backup.ErrRestoreToken, backup.ErrTooLarge, backup.ErrInvalidRetention,
+		fmt.Errorf("%w: bad field", backup.ErrInvalidCron),
+		&backup.LockedError{Field: "endpoint"},
+		&s3store.Error{Code: "AccessDenied", Message: "denied"},
+		&s3store.Error{Message: "timeout"},
+		&backup.SpaceError{Need: 300 << 20, Free: 100 << 20},
+	)
+	han := regexp.MustCompile(`\p{Han}`)
+	singleton.Localizer = i18n.NewLocalizer("en_US", "nezha", "translations", i18n.Translations)
+	english := make([]string, len(errs))
+	for i, e := range errs {
+		english[i] = localizeBackupError(e).Error()
+	}
+	for _, lang := range []string{"zh_CN", "zh_TW"} {
+		singleton.Localizer = i18n.NewLocalizer(lang, "nezha", "translations", i18n.Translations)
+		for i, e := range errs {
+			got := localizeBackupError(e).Error()
+			assert.NotEqual(t, english[i], got, "%s: %q is not translated", lang, english[i])
+			assert.True(t, han.MatchString(got), "%s: %q", lang, got)
+		}
+	}
+
+	singleton.Localizer = i18n.NewLocalizer("zh_CN", "nezha", "translations", i18n.Translations)
+	assert.Equal(t, "备份密码或恢复密钥错误", localizeBackupError(backup.ErrWrongPassword).Error())
+	assert.Equal(t, fmt.Sprintf("保留份数必须在 1 到 %d 之间", backup.MaxRetention), localizeBackupError(backup.ErrInvalidRetention).Error())
+	singleton.Localizer = i18n.NewLocalizer("zh_TW", "nezha", "translations", i18n.Translations)
+	assert.Equal(t, "備份密碼或復原金鑰錯誤", localizeBackupError(backup.ErrWrongPassword).Error())
 }
 
 // xgettext (script/i18n.sh, -kErrorT) only extracts literal msgids.
