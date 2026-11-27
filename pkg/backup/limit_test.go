@@ -229,3 +229,130 @@ func TestDiskSpaceChecks(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, res.CanApply)
 }
+
+// fakeDisk reports the free space of a disk of a fixed size minus what has
+// been written to the data directory, like a real file system would.
+func fakeDisk(t *testing.T, dir string, free int64) func(string) (int64, error) {
+	return func(string) (int64, error) {
+		var used int64
+		_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				if info, err := d.Info(); err == nil {
+					used += info.Size()
+				}
+			}
+			return nil
+		})
+		return free - used, nil
+	}
+}
+
+func TestGuardedWriterChecksWhileWriting(t *testing.T) {
+	var checks []int64
+	allowed := int64(20 << 20)
+	var buf bytes.Buffer
+	w := guardSpace(&buf, func(n int64) error {
+		checks = append(checks, n)
+		if int64(buf.Len())+n > allowed {
+			return &SpaceError{Need: n, Free: allowed - int64(buf.Len())}
+		}
+		return nil
+	}, 0)
+	chunk := bytes.Repeat([]byte("x"), 1<<20)
+	var err error
+	for range 64 {
+		if _, err = w.Write(chunk); err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, ErrInsufficientSpace)
+	assert.LessOrEqual(t, int64(buf.Len()), allowed, "it stops before the budget is exceeded")
+	assert.Equal(t, int64(16<<20), int64(buf.Len()), "one check per 8 MiB")
+	assert.Equal(t, []int64{8 << 20, 8 << 20, 8 << 20}, checks)
+
+	// A single write larger than the interval is checked as a whole.
+	checks = nil
+	big := guardSpace(io.Discard, func(n int64) error { checks = append(checks, n); return nil }, 0)
+	_, err = big.Write(make([]byte, 20<<20))
+	require.NoError(t, err)
+	assert.Equal(t, []int64{20 << 20}, checks)
+
+	// A stream of known size only asks for what is left to write.
+	checks = nil
+	known := guardSpace(io.Discard, func(n int64) error { checks = append(checks, n); return nil }, 10<<20)
+	for range 10 {
+		_, err = known.Write(chunk)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, []int64{8 << 20, 2 << 20}, checks)
+
+	assert.Equal(t, io.Writer(&buf), guardSpace(&buf, nil, 0))
+}
+
+// An upload of unknown length is held to the disk budget while it is
+// written: it stops before cutting into the reserve and leaves no file.
+func TestSaveUploadKeepsTheReserve(t *testing.T) {
+	dir := t.TempDir()
+	const room = 24 << 20
+	m := &Manager{opts: Options{DataDir: dir, MaxBackupBytes: 1 << 30}}
+	m.opts.DiskFree = fakeDisk(t, dir, diskReserve+room)
+
+	first, err := m.SaveUpload(io.LimitReader(zeroReader{}, 20<<20), 0)
+	require.NoError(t, err)
+	_, err = m.SaveUpload(io.LimitReader(zeroReader{}, 20<<20), 0)
+	require.ErrorIs(t, err, ErrInsufficientSpace)
+	free, _ := m.opts.DiskFree(dir)
+	assert.GreaterOrEqual(t, free, diskReserve, "the reserve stays free")
+	entries, err := os.ReadDir(filepath.Join(dir, tmpDirName))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the failed upload left nothing behind")
+	assert.Equal(t, filepath.Base(first), entries[0].Name())
+
+	// Over the size limit: refused and removed, whatever the request declared.
+	m.opts.MaxBackupBytes = 1 << 20
+	m.opts.DiskFree = func(string) (int64, error) { return 1 << 40, nil }
+	_, err = m.SaveUpload(io.LimitReader(zeroReader{}, 2<<20), 0)
+	require.ErrorIs(t, err, ErrTooLarge)
+	entries, err = os.ReadDir(filepath.Join(dir, tmpDirName))
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func TestAcquireUploadIsExclusive(t *testing.T) {
+	m := &Manager{}
+	release, err := m.AcquireUpload()
+	require.NoError(t, err)
+	_, err = m.AcquireUpload()
+	require.ErrorIs(t, err, ErrBusy)
+	release()
+	release, err = m.AcquireUpload()
+	require.NoError(t, err)
+	release()
+}
+
+// A restore check that runs out of disk while unpacking reports the space
+// error, not a corrupt file, and carries the cause for translation.
+func TestUnpackOutOfSpaceKeepsTheCause(t *testing.T) {
+	e := newTestEnv(t)
+	e.configure()
+	b := e.backup(TriggerManual)
+	// Enough for the download, the reserve, and the database already on
+	// disk, but not for the unpacked database.
+	used, _ := fakeDisk(t, e.dir, 0)(e.dir)
+	e.diskFree = fakeDisk(t, e.dir, diskReserve-used+b.Size+1)
+	e.advance(rateWindow)
+	e.m = e.newManager("v1.2.3")
+	res, err := e.prepare(b, testPassword)
+	require.NoError(t, err)
+	require.False(t, res.CanApply)
+	c := lastCheck(res)
+	assert.Equal(t, CheckPayload, c.Code)
+	require.ErrorIs(t, c.Err, ErrInsufficientSpace)
+}

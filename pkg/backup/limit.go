@@ -58,6 +58,7 @@ func MaxBytesFromEnv() int64 {
 		return DefaultMaxBackupBytes
 	}
 	if strings.TrimSpace(v) != "" {
+		// #nosec G706 -- n is an integer validated by ParseMaxSizeMB, not raw input
 		log.Printf("NEZHA>> backup: size limit set to %d MiB by %s", n>>20, EnvMaxSizeMB)
 	}
 	return n
@@ -94,6 +95,86 @@ func (m *Manager) EnsureSpace(n int64) error {
 		return &SpaceError{Need: need, Free: free}
 	}
 	return nil
+}
+
+// spaceCheckInterval is how much a guarded writer writes between two
+// checks of the free space.
+const spaceCheckInterval int64 = 8 << 20
+
+// guardedWriter checks the free disk space before every spaceCheckInterval
+// bytes it writes (or before the rest of the stream, when its size is known
+// and smaller), so a stream of unknown length stops before it eats into
+// diskReserve. Streams written at the same time can each pass one check
+// before the other writes, so they may overshoot by at most one interval
+// each; uploads are therefore received one at a time (AcquireUpload).
+type guardedWriter struct {
+	w        io.Writer
+	check    func(int64) error
+	expected int64 // total size of the stream, 0 when unknown
+	written  int64
+	budget   int64
+}
+
+// guardSpace wraps w with check; a nil check returns w unchanged. expected
+// is the size of the stream when known, otherwise 0.
+func guardSpace(w io.Writer, check func(int64) error, expected int64) io.Writer {
+	if check == nil {
+		return w
+	}
+	return &guardedWriter{w: w, check: check, expected: expected}
+}
+
+func (g *guardedWriter) Write(p []byte) (int, error) {
+	if n := int64(len(p)); n > g.budget {
+		next := spaceCheckInterval
+		if g.expected > 0 {
+			next = min(next, g.expected-g.written)
+		}
+		next = max(next, n)
+		if err := g.check(next); err != nil {
+			return 0, err
+		}
+		g.budget = next
+	}
+	n, err := g.w.Write(p)
+	g.budget -= int64(n)
+	g.written += int64(n)
+	return n, err
+}
+
+// AcquireUpload reserves the only slot for receiving an uploaded backup.
+// The caller holds it until the upload has been checked (Prepare returned),
+// so at most one uploaded file is staged at a time. It fails with ErrBusy
+// while another upload holds it.
+func (m *Manager) AcquireUpload() (release func(), err error) {
+	if !m.uploadMu.TryLock() {
+		return nil, ErrBusy
+	}
+	return m.uploadMu.Unlock, nil
+}
+
+// SaveUpload writes an uploaded backup below the data directory and
+// returns its path. It enforces the size limit and the free space while
+// writing, so it does not rely on the declared length of the request, and
+// removes the file when it fails. sizeHint is an upper bound of the size
+// when the request declared its length, otherwise 0.
+func (m *Manager) SaveUpload(r io.Reader, sizeHint int64) (string, error) {
+	f, err := m.UploadTempFile()
+	if err != nil {
+		return "", err
+	}
+	n, err := io.Copy(guardSpace(f, m.EnsureSpace, max(sizeHint, 0)), io.LimitReader(r, m.opts.MaxBackupBytes+1))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && n > m.opts.MaxBackupBytes {
+		err = tooLargeError(n, m.opts.MaxBackupBytes)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // capReader fails once more than n bytes are read.

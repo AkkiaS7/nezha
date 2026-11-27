@@ -64,6 +64,8 @@ type Check struct {
 	Code    string `json:"code" enums:"checksum,decrypt,payload,origin,version,database_integrity,admin_user"`
 	OK      bool   `json:"ok"`
 	Message string `json:"message,omitempty"`
+	// Err is the cause of a failed check, for callers that translate it.
+	Err error `json:"-" swaggerignore:"true"`
 }
 
 // Warning is something the administrator must know before applying a
@@ -313,7 +315,7 @@ func (m *Manager) prepare(ctx context.Context, req PrepareRequest) (*PrepareResu
 	}
 
 	fail := func(code string, err error) (*PrepareResult, *restoreStage, error) {
-		res.Checks = append(res.Checks, Check{Code: code, OK: false, Message: err.Error()})
+		res.Checks = append(res.Checks, Check{Code: code, OK: false, Message: err.Error(), Err: err})
 		return res, nil, nil
 	}
 	payload, err := decryptPayload(f, identity)
@@ -461,7 +463,7 @@ func (m *Manager) download(ctx context.Context, s Settings, name, dst string) (s
 	if err != nil {
 		return "", err
 	}
-	hw := newHashingWriter(f)
+	hw := newHashingWriter(guardSpace(f, m.EnsureSpace, info.Size))
 	_, err = io.Copy(hw, io.LimitReader(rc, m.opts.MaxBackupBytes+1))
 	if cerr := f.Close(); err == nil {
 		err = cerr

@@ -93,7 +93,9 @@ func localizeBackupError(err error) error {
 	case errors.Is(err, backup.ErrInvalidRetention):
 		return l.ErrorT("retention must be between 1 and %d", backup.MaxRetention)
 	case errors.Is(err, backup.ErrTooLarge) && singleton.BackupShared != nil:
-		return l.ErrorT("backup file exceeds the size limit (%d MiB); the limit can be raised with the environment variable %s", singleton.BackupShared.MaxBackupBytes()>>20, backup.EnvMaxSizeMB)
+		return fmt.Errorf("%w; %w",
+			l.ErrorT("backup file exceeds the size limit (%d MiB)", singleton.BackupShared.MaxBackupBytes()>>20),
+			l.ErrorT("set the environment variable %s to raise the limit", backup.EnvMaxSizeMB))
 	case errors.Is(err, backup.ErrTooLarge):
 		return l.ErrorT("backup file exceeds the size limit")
 	case errors.As(err, &spaceErr):
@@ -514,6 +516,13 @@ func prepareRestore(c *gin.Context) (*RestorePrepareResponse, error) {
 	}
 	req := backup.PrepareRequest{Actor: backupActor(c)}
 	if strings.HasPrefix(c.ContentType(), "multipart/") {
+		// One upload is received and checked at a time, so concurrent
+		// uploads cannot together use up the space kept free.
+		release, err := m.AcquireUpload()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 		if err := readRestoreUpload(c, m, &req); err != nil {
 			if req.UploadPath != "" {
 				_ = os.Remove(req.UploadPath)
@@ -530,6 +539,13 @@ func prepareRestore(c *gin.Context) (*RestorePrepareResponse, error) {
 	res, err := m.Prepare(c.Request.Context(), req)
 	if err != nil {
 		return nil, err
+	}
+	// Failed checks carry their cause; translate it like any other error.
+	// The check code stays as it is.
+	for i := range res.Checks {
+		if e := res.Checks[i].Err; e != nil {
+			res.Checks[i].Message = localizeBackupError(e).Error()
+		}
 	}
 	requires, err := restoreRequirements(c)
 	if err != nil {
@@ -566,21 +582,11 @@ func readRestoreUpload(c *gin.Context, m *backup.Manager, req *backup.PrepareReq
 			if req.UploadPath != "" {
 				return errUploadMultiple
 			}
-			f, err := m.UploadTempFile()
+			path, err := m.SaveUpload(part, c.Request.ContentLength)
 			if err != nil {
 				return err
 			}
-			req.UploadPath = f.Name()
-			n, err := io.Copy(f, io.LimitReader(part, m.MaxBackupBytes()+1))
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
-			if err != nil {
-				return err
-			}
-			if n > m.MaxBackupBytes() {
-				return backup.ErrTooLarge
-			}
+			req.UploadPath = path
 		case "password", "recovery_key", "name", "sha256":
 			v, err := io.ReadAll(io.LimitReader(part, 4096))
 			if err != nil {

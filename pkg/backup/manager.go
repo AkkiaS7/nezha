@@ -126,6 +126,8 @@ type Manager struct {
 	listAt    time.Time
 	statCache map[string]ObjectInfo
 
+	uploadMu sync.Mutex // one uploaded backup received and checked at a time
+
 	restoreMu sync.Mutex
 	stage     *restoreStage
 
@@ -820,7 +822,7 @@ func (m *Manager) runBackup(ctx context.Context, name string, s Settings) (Backu
 		AuthKeyID: authKeyID(s.authKey()),
 	}
 	outPath := filepath.Join(tmp, name+FileExt)
-	sum, size, unpacked, err := writeBackupFile(outPath, header, s.Encryption.Recipient, manifest, sources, s.authKey())
+	sum, size, unpacked, err := writeBackupFile(outPath, header, s.Encryption.Recipient, manifest, sources, s.authKey(), m.EnsureSpace)
 	if err != nil {
 		return BackupInfo{}, err
 	}
@@ -854,13 +856,13 @@ func tooLargeError(n, limit int64) error {
 
 // writeBackupFile returns the checksum and size of the file and the
 // unpacked size of its payload.
-func writeBackupFile(path string, h Header, recipient string, manifest *Manifest, sources map[string]string, authKey []byte) (string, int64, int64, error) {
+func writeBackupFile(path string, h Header, recipient string, manifest *Manifest, sources map[string]string, authKey []byte, space func(int64) error) (string, int64, int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600) // #nosec G304 -- dashboard temp dir
 	if err != nil {
 		return "", 0, 0, err
 	}
 	var unpacked int64
-	hw := newHashingWriter(f)
+	hw := newHashingWriter(guardSpace(f, space, 0))
 	w, err := encryptTo(hw, h, recipient)
 	if err == nil {
 		unpacked, err = writePayload(w, manifest, sources, authKey)

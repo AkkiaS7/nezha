@@ -237,7 +237,7 @@ func extractEntries(tr *tar.Reader, dir string, maxBytes int64, space func(int64
 				}
 			}
 			path := filepath.Join(dir, fixed)
-			entry, err := writeExclusive(path, tr, hdr.Size)
+			entry, err := writeExclusive(path, tr, hdr.Size, space)
 			if err != nil {
 				return nil, err
 			}
@@ -271,15 +271,18 @@ func extractEntries(tr *tar.Reader, dir string, maxBytes int64, space func(int64
 
 // writeExclusive creates path (which must not exist) with mode 0600 and
 // copies exactly size bytes from r into it.
-func writeExclusive(path string, r io.Reader, size int64) (FileEntry, error) {
+func writeExclusive(path string, r io.Reader, size int64, space func(int64) error) (FileEntry, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600) // #nosec G304 -- path is a fixed name inside a dashboard-created directory
 	if err != nil {
 		return FileEntry{}, err
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, size))
+	n, err := io.Copy(io.MultiWriter(guardSpace(f, space, size), h), io.LimitReader(r, size))
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if errors.Is(err, ErrInsufficientSpace) {
+		return FileEntry{}, err
 	}
 	if err != nil {
 		return FileEntry{}, ErrCorrupt
