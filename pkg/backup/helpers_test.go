@@ -157,6 +157,7 @@ type testEnv struct {
 	m        *Manager
 	restarts atomic.Int32
 	maxBytes int64
+	diskFree func(string) (int64, error)
 
 	restoreName, restoreSHA string
 	now                     time.Time
@@ -215,6 +216,8 @@ func (e *testEnv) newManager(version string) *Manager {
 		Now:            e.clock,
 		RetryDelay:     time.Millisecond,
 		MaxBackupBytes: e.maxBytes,
+		DatabasePath:   e.dbPath,
+		DiskFree:       e.diskFree,
 	})
 	require.NoError(e.t, err)
 	e.t.Cleanup(m.Close)

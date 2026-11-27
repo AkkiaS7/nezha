@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -385,6 +387,31 @@ func TestBackupUploadBodyLimit(t *testing.T) {
 
 	rec = env.as(env.adminCaller(), "PATCH", "/api/v1/backup/config", map[string]any{"s3": map[string]any{"prefix": strings.Repeat("a", 2<<20)}})
 	assert.False(t, decodeResponse[any](t, rec).Success)
+}
+
+// An upload is refused before its body is streamed when the data directory
+// cannot hold it, and the size limit error names the variable that raises it.
+func TestBackupUploadChecksDiskSpaceAndNamesTheLimit(t *testing.T) {
+	env := newBackupTestEnv(t)
+	opts := env.managerOptions()
+	opts.DiskFree = func(string) (int64, error) { return 1 << 20, nil }
+	m, err := backup.NewManager(opts)
+	require.NoError(t, err)
+	t.Cleanup(m.Close)
+	singleton.BackupShared = m
+
+	rec := env.as(env.adminCaller(), "POST", "/api/v1/backup/restore/prepare", newMultipart(t, map[string]string{"password": mockBackupPassword}, []byte("data")))
+	resp := decodeResponse[any](t, rec)
+	assert.False(t, resp.Success)
+	assert.Contains(t, resp.Error, "not enough free disk space")
+	entries, err := os.ReadDir(filepath.Join(env.dir, ".backup-tmp"))
+	if err == nil {
+		assert.Empty(t, entries, "nothing of the upload was written")
+	}
+
+	msg := localizeBackupError(fmt.Errorf("x: %w", backup.ErrTooLarge)).Error()
+	assert.Contains(t, msg, fmt.Sprintf("(%d MiB)", backup.DefaultMaxBackupBytes>>20))
+	assert.Contains(t, msg, backup.EnvMaxSizeMB)
 }
 
 // An administrator without a usable password (OAuth only) must have signed

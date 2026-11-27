@@ -34,8 +34,8 @@ const (
 
 const (
 	// DefaultMaxBackupBytes caps a downloaded or uploaded backup file and the
-	// size of its decrypted payload.
-	DefaultMaxBackupBytes int64 = 256 << 20
+	// size of its decrypted payload unless EnvMaxSizeMB sets another limit.
+	DefaultMaxBackupBytes int64 = 1 << 30
 	// PreRestoreKeep is how many pre-restore backups retention keeps.
 	PreRestoreKeep = 3
 	// ResetConfirmWord must be sent to reset the backup password.
@@ -78,7 +78,10 @@ type Options struct {
 	// DataDir is the directory of the database file. Temporary files,
 	// staged restores, restore results and the audit log live here, so a
 	// Docker deployment that only mounts the data directory needs nothing new.
-	DataDir      string
+	DataDir string
+	// DatabasePath is the live database file. When set, a backup first
+	// checks that the data directory has room for its snapshot and file.
+	DatabasePath string
 	ConfigPath   string
 	SettingsPath string
 	Version      string
@@ -98,6 +101,9 @@ type Options struct {
 	AllowLoopbackHTTP bool
 	// RetryDelay is the base delay between upload attempts.
 	RetryDelay time.Duration
+	// DiskFree returns the bytes available on the file system of a
+	// directory (tests replace it).
+	DiskFree func(dir string) (int64, error)
 }
 
 // Manager runs backups and restores.
@@ -147,6 +153,9 @@ func NewManager(opts Options) (*Manager, error) {
 	}
 	if opts.MaxBackupBytes <= 0 {
 		opts.MaxBackupBytes = DefaultMaxBackupBytes
+	}
+	if opts.DiskFree == nil {
+		opts.DiskFree = diskFree
 	}
 	if opts.RetryDelay <= 0 {
 		opts.RetryDelay = 2 * time.Second
@@ -751,6 +760,15 @@ func (m *Manager) runBackup(ctx context.Context, name string, s Settings) (Backu
 	if s.Encryption == nil {
 		return BackupInfo{}, ErrPasswordNotSet
 	}
+	// The snapshot and the encrypted file (at most as large as the
+	// snapshot, it is compressed) live next to the database until uploaded.
+	if m.opts.DatabasePath != "" {
+		if st, err := os.Stat(m.opts.DatabasePath); err == nil {
+			if err := m.EnsureSpace(2 * st.Size()); err != nil {
+				return BackupInfo{}, err
+			}
+		}
+	}
 	tmp := filepath.Join(m.opts.DataDir, tmpDirName, name)
 	if err := os.MkdirAll(tmp, 0700); err != nil {
 		return BackupInfo{}, err
@@ -827,7 +845,11 @@ func (m *Manager) runBackup(ctx context.Context, name string, s Settings) (Backu
 // tooLarge is the error of a backup that would exceed the size limit shared
 // by backup, download, upload and restore.
 func (m *Manager) tooLarge(n int64) error {
-	return fmt.Errorf("%w: %d bytes, the limit is %d bytes", ErrTooLarge, n, m.opts.MaxBackupBytes)
+	return tooLargeError(n, m.opts.MaxBackupBytes)
+}
+
+func tooLargeError(n, limit int64) error {
+	return fmt.Errorf("%w: %d bytes, the limit is %d MiB (%s)", ErrTooLarge, n, limit>>20, EnvMaxSizeMB)
 }
 
 // writeBackupFile returns the checksum and size of the file and the

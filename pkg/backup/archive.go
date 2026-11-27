@@ -166,14 +166,27 @@ type extracted struct {
 
 // extractPayload unpacks a decrypted payload into dir, which must be an
 // empty directory owned by the dashboard. Only the known entry names are
-// accepted, each at most once, as regular files; the total size is capped by
-// maxBytes. Every data file must match the manifest exactly.
-func extractPayload(r io.Reader, dir string, maxBytes int64) (*extracted, error) {
+// accepted, each at most once, as regular files, so there are at most four
+// entries. The total size of the entries is capped by maxBytes and the whole
+// decompressed stream (which also carries tar headers that archive/tar reads
+// on its own, such as PAX records) by maxBytes plus a small overhead, so a
+// highly compressed payload cannot keep the dashboard busy. Every data file
+// must match the manifest exactly. space, when not nil, is asked before a
+// data file is written whether its size fits on the disk.
+func extractPayload(r io.Reader, dir string, maxBytes int64, space func(int64) error) (*extracted, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
-	tr := tar.NewReader(gz)
+	capped := &capReader{r: gz, n: maxBytes + payloadOverhead}
+	ex, err := extractEntries(tar.NewReader(capped), dir, maxBytes, space)
+	if capped.exceeded {
+		return nil, fmt.Errorf("%w: the unpacked payload is larger than the limit of %d MiB (%s)", ErrTooLarge, maxBytes>>20, EnvMaxSizeMB)
+	}
+	return ex, err
+}
+
+func extractEntries(tr *tar.Reader, dir string, maxBytes int64, space func(int64) error) (*extracted, error) {
 	out := &extracted{Paths: map[string]string{}}
 	seen := map[string]bool{}
 	hashes := map[string]FileEntry{}
@@ -191,8 +204,11 @@ func extractPayload(r io.Reader, dir string, maxBytes int64) (*extracted, error)
 			return nil, fmt.Errorf("%w: unexpected entry %q", ErrCorrupt, name)
 		}
 		seen[name] = true
-		if hdr.Size < 0 || hdr.Size > remaining {
-			return nil, fmt.Errorf("%w: payload exceeds the size limit", ErrCorrupt)
+		if hdr.Size < 0 {
+			return nil, ErrCorrupt
+		}
+		if hdr.Size > remaining {
+			return nil, fmt.Errorf("%w: the unpacked payload is larger than the limit of %d MiB (%s)", ErrTooLarge, maxBytes>>20, EnvMaxSizeMB)
 		}
 		remaining -= hdr.Size
 		switch name {
@@ -214,6 +230,11 @@ func extractPayload(r io.Reader, dir string, maxBytes int64) (*extracted, error)
 			fixed := FileDatabase
 			if name == FileConfig {
 				fixed = FileConfig
+			}
+			if space != nil {
+				if err := space(hdr.Size); err != nil {
+					return nil, err
+				}
 			}
 			path := filepath.Join(dir, fixed)
 			entry, err := writeExclusive(path, tr, hdr.Size)

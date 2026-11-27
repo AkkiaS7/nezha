@@ -73,6 +73,7 @@ func localizeBackupError(err error) error {
 	}
 	var locked *backup.LockedError
 	var storageErr *s3store.Error
+	var spaceErr *backup.SpaceError
 	switch {
 	case errors.As(err, &locked):
 		return l.ErrorT("%s: this setting is managed by an environment variable", locked.Field)
@@ -92,9 +93,11 @@ func localizeBackupError(err error) error {
 	case errors.Is(err, backup.ErrInvalidRetention):
 		return l.ErrorT("retention must be between 1 and %d", backup.MaxRetention)
 	case errors.Is(err, backup.ErrTooLarge) && singleton.BackupShared != nil:
-		return l.ErrorT("backup file exceeds the size limit (%d MiB)", singleton.BackupShared.MaxBackupBytes()>>20)
+		return l.ErrorT("backup file exceeds the size limit (%d MiB); the limit can be raised with the environment variable %s", singleton.BackupShared.MaxBackupBytes()>>20, backup.EnvMaxSizeMB)
 	case errors.Is(err, backup.ErrTooLarge):
 		return l.ErrorT("backup file exceeds the size limit")
+	case errors.As(err, &spaceErr):
+		return l.ErrorT("not enough free disk space in the data directory: %d MiB needed, %d MiB free", spaceErr.Need>>20, spaceErr.Free>>20)
 	}
 	for _, m := range []struct {
 		target error
@@ -539,6 +542,13 @@ func prepareRestore(c *gin.Context) (*RestorePrepareResponse, error) {
 // readRestoreUpload streams the multipart upload to a temporary file below
 // the data directory, without buffering it in memory.
 func readRestoreUpload(c *gin.Context, m *backup.Manager, req *backup.PrepareRequest) error {
+	// The body is the backup file plus the multipart framing; refuse it
+	// before streaming anything when the data directory cannot hold it.
+	if n := c.Request.ContentLength; n > 0 {
+		if err := m.EnsureSpace(min(n, m.MaxBackupBytes())); err != nil {
+			return err
+		}
+	}
 	mr, err := c.Request.MultipartReader()
 	if err != nil {
 		return err

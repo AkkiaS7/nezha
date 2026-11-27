@@ -93,7 +93,7 @@ func TestBackupUploadsEncryptedFile(t *testing.T) {
 	payload, err := decryptPayload(r, id)
 	require.NoError(t, err)
 	out := t.TempDir()
-	ex, err := extractPayload(payload, out, DefaultMaxBackupBytes)
+	ex, err := extractPayload(payload, out, DefaultMaxBackupBytes, nil)
 	require.NoError(t, err)
 	assert.True(t, ex.Manifest.matchesHeader(h))
 	assert.Equal(t, int64(2), ex.Manifest.Tables["servers"])
@@ -575,7 +575,7 @@ func TestMaliciousPayloadsAreRejected(t *testing.T) {
 			require.NoError(t, err)
 			payload, err := decryptPayload(r, id)
 			require.NoError(t, err)
-			_, err = extractPayload(payload, dir, DefaultMaxBackupBytes)
+			_, err = extractPayload(payload, dir, DefaultMaxBackupBytes, nil)
 			require.ErrorIs(t, err, ErrCorrupt)
 			_, err = os.Stat(filepath.Join(filepath.Dir(dir), "sqlite.db"))
 			assert.True(t, os.IsNotExist(err))
@@ -614,7 +614,7 @@ func repack(t *testing.T, e *testEnv, b BackupInfo, recovery string, edit func(m
 	require.NoError(t, err)
 	payload, err := decryptPayload(r, id)
 	require.NoError(t, err)
-	ex, err := extractPayload(payload, t.TempDir(), DefaultMaxBackupBytes)
+	ex, err := extractPayload(payload, t.TempDir(), DefaultMaxBackupBytes, nil)
 	require.NoError(t, err)
 	m := ex.Manifest
 	mac := ex.MAC

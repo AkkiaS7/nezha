@@ -270,7 +270,7 @@ func (m *Manager) prepare(ctx context.Context, req PrepareRequest) (*PrepareResu
 			return nil, nil, err
 		}
 		if size > m.opts.MaxBackupBytes {
-			return nil, nil, ErrTooLarge
+			return nil, nil, tooLargeError(size, m.opts.MaxBackupBytes)
 		}
 		res.SHA256 = sum
 	} else {
@@ -325,7 +325,7 @@ func (m *Manager) prepare(ctx context.Context, req PrepareRequest) (*PrepareResu
 	if err := os.Mkdir(filesDir, 0700); err != nil {
 		return nil, nil, err
 	}
-	ex, err := extractPayload(payload, filesDir, m.opts.MaxBackupBytes)
+	ex, err := extractPayload(payload, filesDir, m.opts.MaxBackupBytes, m.EnsureSpace)
 	if err == nil {
 		// Drain the rest so a truncated or modified tail fails authentication.
 		if _, cerr := io.Copy(io.Discard, payload); cerr != nil {
@@ -452,7 +452,10 @@ func (m *Manager) download(ctx context.Context, s Settings, name, dst string) (s
 	}
 	defer rc.Close()
 	if info.Size > m.opts.MaxBackupBytes {
-		return "", ErrTooLarge
+		return "", tooLargeError(info.Size, m.opts.MaxBackupBytes)
+	}
+	if err := m.EnsureSpace(info.Size); err != nil {
+		return "", err
 	}
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600) // #nosec G304 -- staging dir
 	if err != nil {
@@ -467,7 +470,7 @@ func (m *Manager) download(ctx context.Context, s Settings, name, dst string) (s
 		return "", err
 	}
 	if hw.n > m.opts.MaxBackupBytes {
-		return "", ErrTooLarge
+		return "", tooLargeError(hw.n, m.opts.MaxBackupBytes)
 	}
 	return hw.sum(), nil
 }

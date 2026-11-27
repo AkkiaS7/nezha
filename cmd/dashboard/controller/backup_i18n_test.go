@@ -43,12 +43,13 @@ func TestBackupErrorsAreLocalized(t *testing.T) {
 	}
 
 	cases := map[error]string{
-		&backup.LockedError{Field: "endpoint"}:                                   "endpoint: this setting is managed by an environment variable",
-		&s3store.Error{Code: "AccessDenied", Message: "denied"}:                  "storage error AccessDenied: denied",
-		&s3store.Error{Message: "timeout"}:                                       "storage error: timeout",
-		fmt.Errorf("%w: bad field", backup.ErrInvalidCron):                       "invalid backup schedule: bad field",
-		backup.ErrInvalidRetention:                                               fmt.Sprintf("retention must be between 1 and %d", backup.MaxRetention),
-		fmt.Errorf("%w: %w", backup.ErrPreRestore, &s3store.Error{Message: "x"}): "pre-restore backup failed, nothing was changed",
+		&backup.LockedError{Field: "endpoint"}:                                          "endpoint: this setting is managed by an environment variable",
+		&s3store.Error{Code: "AccessDenied", Message: "denied"}:                         "storage error AccessDenied: denied",
+		&s3store.Error{Message: "timeout"}:                                              "storage error: timeout",
+		fmt.Errorf("%w: bad field", backup.ErrInvalidCron):                              "invalid backup schedule: bad field",
+		backup.ErrInvalidRetention:                                                      fmt.Sprintf("retention must be between 1 and %d", backup.MaxRetention),
+		fmt.Errorf("%w: %w", backup.ErrPreRestore, &s3store.Error{Message: "x"}):        "pre-restore backup failed, nothing was changed",
+		fmt.Errorf("context: %w", &backup.SpaceError{Need: 300 << 20, Free: 100 << 20}): "not enough free disk space in the data directory: 300 MiB needed, 100 MiB free",
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, localizeBackupError(in).Error())
