@@ -131,3 +131,19 @@ func TestFallbackToFrontendPreservesDashboardRoutes(t *testing.T) {
 		t.Fatalf("/dashboard/assets/app.js status = %d body = %q, want admin asset", w.Code, w.Body.String())
 	}
 }
+
+// A page reloaded in the browser must get 200, not the 404 fallback status.
+func TestFallbackToFrontendServesSettingsPages(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newFrontendFallbackTestRouter(t)
+
+	for _, page := range []string{"/dashboard/settings/backup", "/dashboard/settings/database"} {
+		w := performFrontendFallbackRequest(t, router, page)
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "admin index") {
+			t.Fatalf("%s status = %d body = %q, want 200 admin index", page, w.Code, w.Body.String())
+		}
+	}
+	if w := performFrontendFallbackRequest(t, router, "/dashboard/settings/unknown"); w.Code != http.StatusNotFound {
+		t.Fatalf("/dashboard/settings/unknown status = %d, want 404", w.Code)
+	}
+}
