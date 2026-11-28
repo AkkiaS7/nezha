@@ -74,7 +74,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 		c.Header("Referrer-Policy", "no-referrer")
 		c.Next()
 	}, fallbackToFrontend(frontendDist))
-	r.POST("/mcp", mcpOriginGuard(), mcpOAuthAccessAuth, apiTokenAuthMiddleware(), mcpEndpoint)
+	r.POST("/mcp", mcpOriginGuard(), vacuumWaitMiddleware(singleton.WaitForVacuum), mcpOAuthAccessAuth, apiTokenAuthMiddleware(), mcpEndpoint)
 	// Streamable HTTP 规范要求：不实现 standalone SSE / session 时，GET / DELETE
 	// 必须显式返回 405，让客户端走 POST-only 路径并跳过 session 终止流程。
 	// 不显式注册时，Gin 会走 NoRoute → fallbackToFrontend，对 MCP 客户端是 HTML/404。
@@ -86,7 +86,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 
 	// 所有 /api/v1 请求体统一限长：ShouldBindJSON 会完整读取请求体
 	// （GHSA-8fgr-wx8p-v6q7）。
-	api := r.Group("api/v1", restRequestBodyLimitMiddleware(restAPIRequestMaxBodyBytes))
+	// Requests wait while VACUUM holds the database (session checks included).
+	api := r.Group("api/v1", vacuumWaitMiddleware(singleton.WaitForVacuum), restRequestBodyLimitMiddleware(restAPIRequestMaxBodyBytes))
 	api.POST("/login", authMiddleware.LoginHandler)
 
 	fallbackAuthMw := fallbackAuthMiddleware(authMiddleware)

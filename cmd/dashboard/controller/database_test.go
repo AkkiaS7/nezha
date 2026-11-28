@@ -1,9 +1,12 @@
 package controller
 
 import (
+	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -59,4 +62,42 @@ func TestDatabaseErrorsAreLocalized(t *testing.T) {
 		require.Equal(t, want[2], localizeDatabaseError(singleton.ErrDatabaseBusy).Error(), lang)
 		require.Equal(t, want[2], localizeBackupError(backup.ErrDatabaseBusy).Error(), lang)
 	}
+}
+
+func TestVacuumWaitMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	release := make(chan struct{})
+	wait := func(ctx context.Context) error {
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	r := gin.New()
+	r.GET("/x", vacuumWaitMiddleware(wait), func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	// A client that gives up while VACUUM runs gets 503 and no handler.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx))
+	cancel()
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+		done <- w
+	}()
+	select {
+	case <-done:
+		t.Fatal("the request was served while VACUUM ran")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	w = <-done
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "ok", w.Body.String())
 }

@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"errors"
+	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -77,4 +79,22 @@ func localizeDatabaseError(err error) error {
 		return l.ErrorT("another database cleanup or maintenance is in progress")
 	}
 	return err
+}
+
+// vacuumWaitMiddleware holds a request while a VACUUM runs (wait is
+// singleton.WaitForVacuum). Every authenticated request reads its session
+// from the database, which VACUUM locks exclusively: without waiting it would
+// stall for busy_timeout and then be answered as unauthenticated. A request
+// whose client goes away meanwhile gets 503.
+func vacuumWaitMiddleware(wait func(context.Context) error) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := wait(c.Request.Context()); err != nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, model.CommonResponse[any]{
+				Success: false,
+				Error:   "database maintenance in progress",
+			})
+			return
+		}
+		c.Next()
+	}
 }

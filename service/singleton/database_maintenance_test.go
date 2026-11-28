@@ -25,6 +25,7 @@ func newHistoryCleanupTestDB(t *testing.T) {
 	t.Helper()
 	originalDB, originalTSDB, originalBackup := DB, TSDBShared, BackupShared
 	originalPause, originalDiskFree := historyCleanupPause, diskFreeFunc
+	originalAnnounce, originalGrace := vacuumAnnounceDelay, vacuumGrace
 
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "sqlite.db")), &gorm.Config{})
 	require.NoError(t, err)
@@ -34,6 +35,7 @@ func newHistoryCleanupTestDB(t *testing.T) {
 
 	DB, TSDBShared, BackupShared = db, nil, nil
 	historyCleanupPause = 0
+	vacuumAnnounceDelay, vacuumGrace = 0, 0
 	diskFreeFunc = func(string) int64 { return 0 }
 	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
 	t.Cleanup(func() {
@@ -43,6 +45,7 @@ func newHistoryCleanupTestDB(t *testing.T) {
 		_ = sqlDB.Close()
 		DB, TSDBShared, BackupShared = originalDB, originalTSDB, originalBackup
 		historyCleanupPause, diskFreeFunc = originalPause, originalDiskFree
+		vacuumAnnounceDelay, vacuumGrace = originalAnnounce, originalGrace
 		setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
 	})
 }
@@ -512,4 +515,56 @@ func TestVacuumSkippedWhenUsageCaptureFails(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, u.Estimate)
 	require.Equal(t, job, u.Job)
+}
+
+// Requests wait in WaitForVacuum while VACUUM runs and go on when it ends.
+func TestWaitForVacuum(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	seedHistory(t, time.Now(), 0)
+	require.NoError(t, WaitForVacuum(context.Background())) // no VACUUM
+
+	entered, release := blockVacuum(t)
+	maintained := make(chan error, 1)
+	go func() { maintained <- PerformMaintenance() }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	require.ErrorIs(t, WaitForVacuum(ctx), context.DeadlineExceeded)
+	cancel()
+
+	waited := make(chan error, 1)
+	go func() { waited <- WaitForVacuum(context.Background()) }()
+	select {
+	case <-waited:
+		t.Fatal("WaitForVacuum returned while VACUUM ran")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	require.NoError(t, <-maintained)
+	require.NoError(t, <-waited)
+}
+
+// A cleanup shows the vacuuming state before VACUUM starts.
+func TestCleanupAnnouncesVacuumBeforeStarting(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	seedHistory(t, time.Now(), 0)
+	vacuumAnnounceDelay = 300 * time.Millisecond
+	entered, release := blockVacuum(t)
+
+	_, err := StartHistoryCleanup(7, true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return currentHistoryJob().State == model.HistoryCleanupVacuuming }, 5*time.Second, 5*time.Millisecond)
+	select {
+	case <-entered:
+		t.Fatal("VACUUM started without announcing the state first")
+	default:
+	}
+	// Requests are not held during the announcement.
+	require.NoError(t, WaitForVacuum(context.Background()))
+	u, err := GetDatabaseUsage(context.Background(), 0)
+	require.NoError(t, err)
+	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
+	<-entered
+	release()
+	require.Equal(t, model.HistoryCleanupSucceeded, waitHistoryCleanup(t).State)
 }

@@ -33,6 +33,15 @@ const (
 // writers take the lock. Tests shorten it.
 var historyCleanupPause = 50 * time.Millisecond
 
+var (
+	// vacuumAnnounceDelay is how long a cleanup shows the vacuuming state
+	// before VACUUM starts: longer than the admin page's 2 s poll interval.
+	vacuumAnnounceDelay = 3 * time.Second
+	// vacuumGrace lets requests that passed WaitForVacuum just before a
+	// VACUUM finish their statements first.
+	vacuumGrace = 500 * time.Millisecond
+)
+
 // diskFreeFunc returns the free space of the file system holding dir, or 0
 // when it cannot be determined (callers then do not check). It shares the
 // implementation of the backup size checks; tests replace it.
@@ -407,6 +416,9 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 		} else {
 			job.State = model.HistoryCleanupVacuuming
 			setHistoryJob(job)
+			// Dashboard requests wait while VACUUM runs, so give a client
+			// polling the job a chance to see this state first.
+			time.Sleep(vacuumAnnounceDelay)
 			if err := runVacuum(ctx); err != nil {
 				fail(fmt.Errorf("deleted %d rows, but VACUUM failed: %w", job.DeletedRows, err))
 				return
@@ -477,7 +489,29 @@ func runVacuum(ctx context.Context) error {
 		vacuumGate.Unlock()
 		close(done)
 	}()
+	// New dashboard requests now wait in WaitForVacuum; let the ones already
+	// past it finish their statements before VACUUM takes the lock.
+	time.Sleep(vacuumGrace)
 	return execVacuum(ctx)
+}
+
+// WaitForVacuum blocks while a VACUUM runs, until it ends or ctx is done.
+// VACUUM holds SQLite's exclusive lock: a request touching the database
+// meanwhile (even only to check its session) would wait busy_timeout and
+// then fail, while one that waits here proceeds as soon as VACUUM ends.
+func WaitForVacuum(ctx context.Context) error {
+	vacuumGate.RLock()
+	done := vacuumDone
+	vacuumGate.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // vacuumSnapshotLocked returns a copy of the usage served while VACUUM runs,
