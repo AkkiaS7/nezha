@@ -41,7 +41,9 @@ type DatabaseUsage struct {
 	HistoryAvailable bool   `json:"history_available"`
 	HistoryRows      int64  `json:"history_rows"`
 	HistoryOldestAt  string `json:"history_oldest_at"`
-	// Estimate is present when retention_days was given and history is available.
+	// Estimate is present when retention_days was given and history is
+	// available. While VACUUM runs the sizes are those taken just before it,
+	// and there is no estimate.
 	Estimate *HistoryCleanupEstimate `json:"estimate,omitempty"`
 	Job      HistoryCleanupJob       `json:"job"`
 }

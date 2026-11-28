@@ -653,3 +653,17 @@ msgstr "用户 ID 未指定"
 
 #~ msgid "timeout: agent connection not established"
 #~ msgstr "超时：agent 连接未建立"
+
+#: cmd/dashboard/controller/backup.go:112
+#: cmd/dashboard/controller/database.go:77
+msgid "another database cleanup or maintenance is in progress"
+msgstr "另一个数据库清理或维护正在进行"
+
+#: cmd/dashboard/controller/database.go:73
+#, c-format
+msgid "retention days must be between %d and %d"
+msgstr "保留天数必须在 %d 到 %d 之间"
+
+#: cmd/dashboard/controller/database.go:75
+msgid "service history is not stored in the SQLite database"
+msgstr "服务监控历史未存储在 SQLite 数据库中"

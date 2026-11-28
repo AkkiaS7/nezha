@@ -51,7 +51,7 @@ var (
 	ErrNotConfigured     = errors.New("backup storage and password must be configured first")
 	ErrStorageMissing    = errors.New("backup storage is not configured")
 	ErrBusy              = errors.New("another backup or restore operation is in progress")
-	ErrDatabaseBusy      = errors.New("a database cleanup or maintenance is in progress")
+	ErrDatabaseBusy      = errors.New("another database cleanup or maintenance is in progress")
 	ErrRestarting        = errors.New("the dashboard is restarting to apply a restore")
 	ErrInvalidName       = errors.New("invalid backup name")
 	ErrPasswordSet       = errors.New("backup password is already set; change or reset it instead")
@@ -169,7 +169,7 @@ func NewManager(opts Options) (*Manager, error) {
 		opts.MaxBackupBytes = DefaultMaxBackupBytes
 	}
 	if opts.DiskFree == nil {
-		opts.DiskFree = diskFree
+		opts.DiskFree = DiskFree
 	}
 	if opts.RetryDelay <= 0 {
 		opts.RetryDelay = 2 * time.Second

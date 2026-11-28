@@ -2,6 +2,7 @@ package singleton
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -322,4 +323,63 @@ func TestBackupOptionsShareDatabaseLock(t *testing.T) {
 	require.ErrorIs(t, err, ErrDatabaseBusy)
 	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
 	opts.DatabaseLock.Unlock()
+}
+
+// While VACUUM holds the exclusive lock, the usage endpoint must answer from
+// the snapshot taken before it instead of waiting for the database.
+func TestDatabaseUsageServedFromSnapshotDuringVacuum(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	seedHistory(t, time.Now(), 0)
+	st, err := readDBFileStats(context.Background())
+	require.NoError(t, err)
+	before, err := GetDatabaseUsage(context.Background(), 0)
+	require.NoError(t, err)
+
+	// Another connection holds the exclusive lock, as VACUUM does.
+	locker, err := sql.Open("sqlite3", st.path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = locker.Close() })
+	conn, err := locker.Conn(context.Background())
+	require.NoError(t, err)
+	_, err = conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE")
+	require.NoError(t, err)
+
+	// Without the snapshot the request waits for the lock.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	_, err = GetDatabaseUsage(ctx, 30)
+	cancel()
+	require.Error(t, err)
+
+	vacuumGate.Lock()
+	vacuumUsage = before
+	vacuumGate.Unlock()
+	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupVacuuming, RetentionDays: 30, Vacuum: true})
+	ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
+	u, err := GetDatabaseUsage(ctx, 30)
+	cancel()
+	require.NoError(t, err)
+	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
+	require.Equal(t, before.DBSize, u.DBSize)
+	require.Equal(t, before.HistoryRows, u.HistoryRows)
+	require.Nil(t, u.Estimate)
+
+	_, err = conn.ExecContext(context.Background(), "ROLLBACK")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	vacuumGate.Lock()
+	vacuumUsage = nil
+	vacuumGate.Unlock()
+}
+
+// runVacuum serves the snapshot only while it runs.
+func TestRunVacuumClearsSnapshot(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	seedHistory(t, time.Now(), 0)
+	require.NoError(t, runVacuum(context.Background()))
+	require.Nil(t, vacuumUsage)
+	require.NoError(t, PerformMaintenance())
+	require.Nil(t, vacuumUsage)
+	u, err := GetDatabaseUsage(context.Background(), 7)
+	require.NoError(t, err)
+	require.NotNil(t, u.Estimate)
 }
