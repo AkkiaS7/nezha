@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nezhahq/nezha/model"
+	"github.com/nezhahq/nezha/pkg/backup"
 )
 
 var (
@@ -32,8 +33,16 @@ const (
 // writers take the lock. Tests shorten it.
 var historyCleanupPause = 50 * time.Millisecond
 
-// diskFreeFunc is replaced by tests.
-var diskFreeFunc = diskFree
+// diskFreeFunc returns the free space of the file system holding dir, or 0
+// when it cannot be determined (callers then do not check). It shares the
+// implementation of the backup size checks; tests replace it.
+var diskFreeFunc = func(dir string) int64 {
+	free, err := backup.DiskFree(dir)
+	if err != nil {
+		return 0
+	}
+	return free
+}
 
 // dbMaintenanceMu is held by the operations that rewrite large parts of the
 // database: the history cleanup, VACUUM (PerformMaintenance) and applying a
@@ -184,7 +193,39 @@ func formatJobTime(t time.Time) string {
 // GetDatabaseUsage reports the database size and the service history
 // cleanup state. With retentionDays > 0 it also estimates what a cleanup with
 // that retention would remove.
+//
+// While a VACUUM runs (from a cleanup or PerformMaintenance) it does not read
+// the database, which VACUUM holds exclusively: without retentionDays it
+// answers at once with the sizes taken just before VACUUM and the current job
+// state; with retentionDays it waits until VACUUM ends, or ctx is done, and
+// then answers with a fresh estimate, so a page asking for one recovers by
+// itself.
 func GetDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUsage, error) {
+	for {
+		// Readers hold the gate while they read, so runVacuum installs the
+		// snapshot only once no request is between its statements: VACUUM
+		// could otherwise take the lock in the middle of one.
+		vacuumGate.RLock()
+		if vacuumUsage == nil {
+			defer vacuumGate.RUnlock()
+			return readDatabaseUsage(ctx, retentionDays)
+		}
+		if retentionDays <= 0 {
+			u := vacuumSnapshotLocked()
+			vacuumGate.RUnlock()
+			return u, nil
+		}
+		done := vacuumDone
+		vacuumGate.RUnlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func readDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUsage, error) {
 	st, err := readDBFileStats(ctx)
 	if err != nil {
 		return nil, err
@@ -366,7 +407,7 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 		} else {
 			job.State = model.HistoryCleanupVacuuming
 			setHistoryJob(job)
-			if err := DB.Exec("VACUUM").Error; err != nil {
+			if err := runVacuum(ctx); err != nil {
 				fail(fmt.Errorf("deleted %d rows, but VACUUM failed: %w", job.DeletedRows, err))
 				return
 			}
@@ -394,4 +435,59 @@ func vacuumHasSpace(st dbFileStats) bool {
 		return false
 	}
 	return true
+}
+
+var (
+	// vacuumGate guards vacuumUsage and vacuumDone; GetDatabaseUsage holds it
+	// for reading while it reads the database.
+	vacuumGate  sync.RWMutex
+	vacuumUsage *model.DatabaseUsage
+	// vacuumDone is closed when the running VACUUM ends.
+	vacuumDone chan struct{}
+)
+
+// Replaced by tests.
+var (
+	captureVacuumUsage = func(ctx context.Context) (*model.DatabaseUsage, error) {
+		return GetDatabaseUsage(ctx, 0)
+	}
+	execVacuum = func(ctx context.Context) error {
+		return DB.WithContext(ctx).Exec("VACUUM").Error
+	}
+)
+
+// runVacuum compacts the database. VACUUM holds SQLite's exclusive lock, so
+// a usage request reading the database would wait for it, and fail once a
+// large database takes longer than busy_timeout. runVacuum first takes the
+// usage that GetDatabaseUsage serves meanwhile; when that fails it does not
+// run VACUUM, since requests would then read the locked database. The caller
+// holds dbMaintenanceMu.
+func runVacuum(ctx context.Context) error {
+	u, err := captureVacuumUsage(ctx)
+	if err != nil {
+		return fmt.Errorf("VACUUM not started, reading the database usage failed: %w", err)
+	}
+	done := make(chan struct{})
+	vacuumGate.Lock() // waits for requests still reading the database
+	vacuumUsage, vacuumDone = u, done
+	vacuumGate.Unlock()
+	defer func() {
+		vacuumGate.Lock()
+		vacuumUsage, vacuumDone = nil, nil
+		vacuumGate.Unlock()
+		close(done)
+	}()
+	return execVacuum(ctx)
+}
+
+// vacuumSnapshotLocked returns a copy of the usage served while VACUUM runs,
+// or nil. The caller holds vacuumGate.
+func vacuumSnapshotLocked() *model.DatabaseUsage {
+	if vacuumUsage == nil {
+		return nil
+	}
+	u := *vacuumUsage
+	u.Estimate = nil
+	u.Job = currentHistoryJob()
+	return &u
 }
