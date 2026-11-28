@@ -218,6 +218,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/online-user/batch-block", restScopeMiddleware(model.ScopeAdminAll), adminHandler(batchBlockOnlineUser))
 	auth.PATCH("/setting", restScopeMiddleware(model.ScopeAdminAll), adminHandler(updateConfig))
 	auth.POST("/maintenance", restScopeMiddleware(model.ScopeAdminAll), adminHandler(runMaintenance))
+	auth.GET("/database/usage", restScopeMiddleware(model.ScopeAdminAll), adminHandler(getDatabaseUsage))
+	auth.POST("/database/history-cleanup", restScopeMiddleware(model.ScopeAdminAll), adminHandler(startHistoryCleanup))
 	registerFrontendRoutes(auth)
 	registerBackupRoutes(auth, patForbidden)
 
@@ -485,6 +487,8 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		regexp.MustCompile(`^/dashboard/settings/mcp-oauth$`),
 		regexp.MustCompile(`^/dashboard/mcp/authorize$`),
 		regexp.MustCompile(`^/dashboard/settings/frontends$`),
+		regexp.MustCompile(`^/dashboard/settings/backup$`),
+		regexp.MustCompile(`^/dashboard/settings/database$`),
 		// 注意：这里的白名单决定哪些 URL 走 index.html fallback；漏一条就会把
 		// 直接刷新该页面变成 404（HTTP 状态码层面，body 仍是 index.html，所以
 		// 浏览器内 SPA 看起来正常，但 monitoring / 链接预览会以为站点挂了）。
