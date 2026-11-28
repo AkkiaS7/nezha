@@ -25,7 +25,7 @@ func TestBackupErrorsAreLocalized(t *testing.T) {
 	t.Cleanup(func() { singleton.Localizer = old })
 
 	same := []error{
-		backup.ErrNotConfigured, backup.ErrStorageMissing, backup.ErrBusy, backup.ErrRestarting, backup.ErrInvalidName,
+		backup.ErrNotConfigured, backup.ErrStorageMissing, backup.ErrBusy, backup.ErrRestarting, backup.ErrDatabaseBusy, backup.ErrInvalidName,
 		backup.ErrPasswordSet, backup.ErrPasswordNotSet, backup.ErrResetConfirm, backup.ErrSecretRequired,
 		backup.ErrInvalidBucketName, backup.ErrRegionTooLong, backup.ErrInvalidPrefix,
 		s3store.ErrEndpointNotURL, s3store.ErrEndpointParts, s3store.ErrEndpointScheme,

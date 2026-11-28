@@ -590,6 +590,18 @@ func (m *Manager) Apply(ctx context.Context, req ApplyRequest) error {
 		return ErrBusy
 	}
 	defer m.op.Unlock()
+	applied := false
+	if lock := m.opts.DatabaseLock; lock != nil {
+		if !lock.TryLock() {
+			return ErrDatabaseBusy
+		}
+		// Kept once the restore is recorded: the process restarts.
+		defer func() {
+			if !applied {
+				lock.Unlock()
+			}
+		}()
+	}
 	stage, s, err := m.takeStageForApply(req)
 	if err != nil {
 		return err
@@ -632,6 +644,7 @@ func (m *Manager) Apply(ctx context.Context, req ApplyRequest) error {
 		return err
 	}
 	m.restarting = true
+	applied = true
 	m.audit.record(auditEntry{Action: "restore_apply", Actor: req.Actor, Name: stage.name, SHA256: stage.sha256, Result: "ok"})
 	if m.opts.Restart != nil {
 		time.AfterFunc(defaultApplyRestartWait, m.opts.Restart)
