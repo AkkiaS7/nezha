@@ -339,7 +339,7 @@ msgid "backup file is corrupt or has been modified"
 msgstr ""
 
 #: cmd/dashboard/controller/backup.go:112
-#: cmd/dashboard/controller/database.go:77
+#: cmd/dashboard/controller/database.go:81
 msgid "another database cleanup or maintenance is in progress"
 msgstr ""
 
@@ -350,4 +350,12 @@ msgstr ""
 
 #: cmd/dashboard/controller/database.go:75
 msgid "service history is not stored in the SQLite database"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:77
+msgid "vacuum mode must be none, online or restart"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:79
+msgid "the dashboard cannot restart itself, so it cannot compact the database while restarting"
 msgstr ""

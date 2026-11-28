@@ -111,7 +111,7 @@ func TestHistoryCleanupDeletesByRetentionRules(t *testing.T) {
 	require.Less(t, usage.Estimate.EstimatedFreeSize, usage.DBSize)
 	require.Equal(t, 2*usage.DBSize-usage.Estimate.EstimatedFreeSize, usage.Estimate.VacuumRequiredSize)
 
-	job, err := StartHistoryCleanup(7, true)
+	job, err := StartHistoryCleanup(7, model.HistoryVacuumModeOnline)
 	require.NoError(t, err)
 	require.Equal(t, model.HistoryCleanupDeleting, job.State)
 	require.NotEmpty(t, job.StartedAt)
@@ -154,7 +154,7 @@ func TestHistoryCleanupLongRetentionKeepsSummariesOfThatAge(t *testing.T) {
 		{ServiceID: service.ID, ServerID: 1, CreatedAt: now.AddDate(0, 0, -100)},
 	}).Error)
 
-	_, err := StartHistoryCleanup(90, false)
+	_, err := StartHistoryCleanup(90, model.HistoryVacuumModeNone)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -171,7 +171,7 @@ func TestHistoryCleanupSkipsVacuumWithoutDiskSpace(t *testing.T) {
 	f := seedHistory(t, time.Now(), 0)
 	diskFreeFunc = func(string) int64 { return 1 }
 
-	_, err := StartHistoryCleanup(7, true)
+	_, err := StartHistoryCleanup(7, model.HistoryVacuumModeOnline)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -188,7 +188,7 @@ func TestHistoryCleanupRejectsConcurrentWork(t *testing.T) {
 	newHistoryCleanupTestDB(t)
 
 	dbMaintenanceMu.Lock()
-	_, err := StartHistoryCleanup(30, true)
+	_, err := StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrDatabaseBusy)
 	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
 	dbMaintenanceMu.Unlock()
@@ -200,7 +200,7 @@ func TestHistoryCleanupRejectsConcurrentWork(t *testing.T) {
 func TestHistoryCleanupValidatesRequest(t *testing.T) {
 	newHistoryCleanupTestDB(t)
 	for _, days := range []int{-1, 0, model.HistoryCleanupMaxRetentionDays + 1} {
-		_, err := StartHistoryCleanup(days, true)
+		_, err := StartHistoryCleanup(days, model.HistoryVacuumModeOnline)
 		require.ErrorIs(t, err, ErrInvalidRetentionDays, days)
 	}
 	require.True(t, ValidHistoryRetentionDays(model.HistoryCleanupMinRetentionDays))
@@ -218,7 +218,7 @@ func TestHistoryCleanupUnavailableWithoutHistoryTable(t *testing.T) {
 	require.Positive(t, usage.DBSize)
 	require.Nil(t, usage.Estimate)
 
-	_, err = StartHistoryCleanup(30, true)
+	_, err = StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrServiceHistoryUnavailable)
 }
 
@@ -283,7 +283,7 @@ func TestHistoryCleanupComparesInstantsAcrossUTCOffsets(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(4), usage.Estimate.DeletableRows)
 
-	_, err = StartHistoryCleanup(7, false)
+	_, err = StartHistoryCleanup(7, model.HistoryVacuumModeNone)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -318,7 +318,7 @@ func TestBackupOptionsShareDatabaseLock(t *testing.T) {
 
 	newHistoryCleanupTestDB(t)
 	require.True(t, opts.DatabaseLock.TryLock()) // as Apply does
-	_, err := StartHistoryCleanup(30, true)
+	_, err := StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrDatabaseBusy)
 	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
 	opts.DatabaseLock.Unlock()
