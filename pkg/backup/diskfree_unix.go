@@ -8,8 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// diskFree returns the bytes available to the process on the file system of path.
-func diskFree(path string) (int64, error) {
+// DiskFree returns the bytes available to the process on the file system of path.
+func DiskFree(path string) (int64, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
 		return 0, err

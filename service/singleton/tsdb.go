@@ -42,7 +42,7 @@ func InitTSDB() error {
 	if !config.Enabled() {
 		log.Println("NEZHA>> TSDB is disabled (tsdb.data_path not configured)")
 		if DB != nil {
-			return DB.AutoMigrate(model.ServiceHistory{})
+			return migrateServiceHistory()
 		}
 		return nil
 	}
@@ -53,7 +53,7 @@ func InitTSDB() error {
 		if errors.Is(err, tsdb.ErrDiskFull) {
 			log.Printf("NEZHA>> Warning: TSDB is unavailable because its disk is full; dashboard and alerts will continue without TSDB writes: %v", err)
 			if DB != nil {
-				if migrateErr := DB.AutoMigrate(model.ServiceHistory{}); migrateErr != nil {
+				if migrateErr := migrateServiceHistory(); migrateErr != nil {
 					log.Printf("NEZHA>> Warning: failed to prepare SQLite service history fallback: %v", migrateErr)
 				}
 			}
@@ -72,6 +72,22 @@ func InitTSDB() error {
 		}
 	}
 
+	return nil
+}
+
+// migrateServiceHistory prepares the SQLite service history table used when
+// TSDB is off, and drops the single-column created_at index of earlier
+// releases: the composite index starts with created_at and serves the same
+// queries. Failing to drop it only costs space, so it is logged.
+func migrateServiceHistory() error {
+	if err := DB.AutoMigrate(model.ServiceHistory{}); err != nil {
+		return err
+	}
+	if DB.Migrator().HasIndex(&model.ServiceHistory{}, model.LegacyServiceHistoryCreatedAtIndex) {
+		if err := DB.Migrator().DropIndex(&model.ServiceHistory{}, model.LegacyServiceHistoryCreatedAtIndex); err != nil {
+			log.Printf("NEZHA>> Warning: failed to drop index %s: %v", model.LegacyServiceHistoryCreatedAtIndex, err)
+		}
+	}
 	return nil
 }
 

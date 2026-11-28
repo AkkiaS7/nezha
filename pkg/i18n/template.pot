@@ -640,3 +640,25 @@ msgstr ""
 #: service/singleton/user.go:132
 msgid "user id not specified"
 msgstr ""
+
+#: cmd/dashboard/controller/backup.go:112
+#: cmd/dashboard/controller/database.go:81
+msgid "another database cleanup or maintenance is in progress"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:73
+#, c-format
+msgid "retention days must be between %d and %d"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:75
+msgid "service history is not stored in the SQLite database"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:77
+msgid "vacuum mode must be none, online or restart"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:79
+msgid "the dashboard cannot restart itself, so it cannot compact the database while restarting"
+msgstr ""

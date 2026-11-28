@@ -20,7 +20,7 @@ import (
 // backupSentinelErrors are the backup errors whose message is a fixed msgid.
 func backupSentinelErrors() []error {
 	return []error{
-		backup.ErrNotConfigured, backup.ErrStorageMissing, backup.ErrBusy, backup.ErrRestarting, backup.ErrInvalidName,
+		backup.ErrNotConfigured, backup.ErrStorageMissing, backup.ErrBusy, backup.ErrRestarting, backup.ErrDatabaseBusy, backup.ErrInvalidName,
 		backup.ErrPasswordSet, backup.ErrPasswordNotSet, backup.ErrResetConfirm, backup.ErrSecretRequired,
 		backup.ErrInvalidBucketName, backup.ErrRegionTooLong, backup.ErrInvalidPrefix,
 		s3store.ErrEndpointNotURL, s3store.ErrEndpointParts, s3store.ErrEndpointScheme,

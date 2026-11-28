@@ -8,8 +8,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// diskFree returns the bytes available to the process on the volume of path.
-func diskFree(path string) (int64, error) {
+// DiskFree returns the bytes available to the process on the volume of path.
+func DiskFree(path string) (int64, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err

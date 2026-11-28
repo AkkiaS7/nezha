@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,4 +132,62 @@ func TestPrepareRemovesTheCheckedBackupFile(t *testing.T) {
 func (e *testEnv) settings() Settings {
 	s, _ := e.m.effective()
 	return s
+}
+
+// A cleanup that is running (holding the shared database lock) refuses the
+// restore, and the check can be applied once it is done.
+func TestApplyRefusedWhileDatabaseLockHeld(t *testing.T) {
+	e := newTestEnv(t)
+	e.configure()
+	b := e.backup(TriggerManual)
+	res, err := e.prepare(b, testPassword)
+	require.NoError(t, err)
+
+	var lock sync.Mutex
+	e.m.opts.DatabaseLock = &lock
+	lock.Lock()
+	require.ErrorIs(t, e.apply(res, testPassword), ErrDatabaseBusy)
+	require.Zero(t, e.restarts.Load())
+	lock.Unlock()
+
+	require.NoError(t, e.apply(res, testPassword))
+	// Kept until the process restarts.
+	require.False(t, lock.TryLock())
+}
+
+// From the pre-restore backup on, the shared lock is held, so a cleanup
+// started meanwhile is refused; a failed apply releases it.
+func TestApplyHoldsDatabaseLockFromPreRestoreBackup(t *testing.T) {
+	e := newTestEnv(t)
+	e.configure()
+	b := e.backup(TriggerManual)
+	res, err := e.prepare(b, testPassword)
+	require.NoError(t, err)
+
+	var lock sync.Mutex
+	e.m.opts.DatabaseLock = &lock
+	snapshot := e.m.opts.Snapshot
+	var heldDuringSnapshot bool
+	e.m.opts.Snapshot = func(context.Context, string) error {
+		heldDuringSnapshot = !lock.TryLock()
+		if !heldDuringSnapshot {
+			lock.Unlock()
+		}
+		return errors.New("injected snapshot failure")
+	}
+	require.ErrorIs(t, e.apply(res, testPassword), ErrPreRestore)
+	require.True(t, heldDuringSnapshot, "a cleanup could start during the pre-restore backup")
+	require.True(t, lock.TryLock(), "a failed apply must release the lock")
+	lock.Unlock()
+
+	e.m.opts.Snapshot = func(ctx context.Context, dst string) error {
+		heldDuringSnapshot = !lock.TryLock()
+		if !heldDuringSnapshot {
+			lock.Unlock()
+		}
+		return snapshot(ctx, dst)
+	}
+	require.NoError(t, e.apply(res, testPassword))
+	require.True(t, heldDuringSnapshot)
+	require.False(t, lock.TryLock())
 }
