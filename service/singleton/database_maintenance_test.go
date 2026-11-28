@@ -2,15 +2,10 @@ package singleton
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"path/filepath"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -116,7 +111,7 @@ func TestHistoryCleanupDeletesByRetentionRules(t *testing.T) {
 	require.Less(t, usage.Estimate.EstimatedFreeSize, usage.DBSize)
 	require.Equal(t, 2*usage.DBSize-usage.Estimate.EstimatedFreeSize, usage.Estimate.VacuumRequiredSize)
 
-	job, err := StartHistoryCleanup(7, true)
+	job, err := StartHistoryCleanup(7, model.HistoryVacuumModeOnline)
 	require.NoError(t, err)
 	require.Equal(t, model.HistoryCleanupDeleting, job.State)
 	require.NotEmpty(t, job.StartedAt)
@@ -159,7 +154,7 @@ func TestHistoryCleanupLongRetentionKeepsSummariesOfThatAge(t *testing.T) {
 		{ServiceID: service.ID, ServerID: 1, CreatedAt: now.AddDate(0, 0, -100)},
 	}).Error)
 
-	_, err := StartHistoryCleanup(90, false)
+	_, err := StartHistoryCleanup(90, model.HistoryVacuumModeNone)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -176,7 +171,7 @@ func TestHistoryCleanupSkipsVacuumWithoutDiskSpace(t *testing.T) {
 	f := seedHistory(t, time.Now(), 0)
 	diskFreeFunc = func(string) int64 { return 1 }
 
-	_, err := StartHistoryCleanup(7, true)
+	_, err := StartHistoryCleanup(7, model.HistoryVacuumModeOnline)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -193,7 +188,7 @@ func TestHistoryCleanupRejectsConcurrentWork(t *testing.T) {
 	newHistoryCleanupTestDB(t)
 
 	dbMaintenanceMu.Lock()
-	_, err := StartHistoryCleanup(30, true)
+	_, err := StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrDatabaseBusy)
 	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
 	dbMaintenanceMu.Unlock()
@@ -205,7 +200,7 @@ func TestHistoryCleanupRejectsConcurrentWork(t *testing.T) {
 func TestHistoryCleanupValidatesRequest(t *testing.T) {
 	newHistoryCleanupTestDB(t)
 	for _, days := range []int{-1, 0, model.HistoryCleanupMaxRetentionDays + 1} {
-		_, err := StartHistoryCleanup(days, true)
+		_, err := StartHistoryCleanup(days, model.HistoryVacuumModeOnline)
 		require.ErrorIs(t, err, ErrInvalidRetentionDays, days)
 	}
 	require.True(t, ValidHistoryRetentionDays(model.HistoryCleanupMinRetentionDays))
@@ -223,7 +218,7 @@ func TestHistoryCleanupUnavailableWithoutHistoryTable(t *testing.T) {
 	require.Positive(t, usage.DBSize)
 	require.Nil(t, usage.Estimate)
 
-	_, err = StartHistoryCleanup(30, true)
+	_, err = StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrServiceHistoryUnavailable)
 }
 
@@ -288,7 +283,7 @@ func TestHistoryCleanupComparesInstantsAcrossUTCOffsets(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(4), usage.Estimate.DeletableRows)
 
-	_, err = StartHistoryCleanup(7, false)
+	_, err = StartHistoryCleanup(7, model.HistoryVacuumModeNone)
 	require.NoError(t, err)
 	job := waitHistoryCleanup(t)
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -323,193 +318,8 @@ func TestBackupOptionsShareDatabaseLock(t *testing.T) {
 
 	newHistoryCleanupTestDB(t)
 	require.True(t, opts.DatabaseLock.TryLock()) // as Apply does
-	_, err := StartHistoryCleanup(30, true)
+	_, err := StartHistoryCleanup(30, model.HistoryVacuumModeOnline)
 	require.ErrorIs(t, err, ErrDatabaseBusy)
 	require.ErrorIs(t, PerformMaintenance(), ErrDatabaseBusy)
 	opts.DatabaseLock.Unlock()
-}
-
-// While VACUUM holds the exclusive lock, the usage endpoint must answer from
-// the snapshot taken before it instead of waiting for the database.
-func TestDatabaseUsageServedFromSnapshotDuringVacuum(t *testing.T) {
-	newHistoryCleanupTestDB(t)
-	seedHistory(t, time.Now(), 0)
-	st, err := readDBFileStats(context.Background())
-	require.NoError(t, err)
-	before, err := GetDatabaseUsage(context.Background(), 0)
-	require.NoError(t, err)
-
-	// Another connection holds the exclusive lock, as VACUUM does.
-	locker, err := sql.Open("sqlite3", st.path)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = locker.Close() })
-	conn, err := locker.Conn(context.Background())
-	require.NoError(t, err)
-	_, err = conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE")
-	require.NoError(t, err)
-
-	// Without the snapshot the request waits for the lock.
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	_, err = GetDatabaseUsage(ctx, 30)
-	cancel()
-	require.Error(t, err)
-
-	done := make(chan struct{})
-	vacuumGate.Lock()
-	vacuumUsage, vacuumDone = before, done
-	vacuumGate.Unlock()
-	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupVacuuming, RetentionDays: 30, Vacuum: true})
-	ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
-	u, err := GetDatabaseUsage(ctx, 0)
-	cancel()
-	require.NoError(t, err)
-	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
-	require.Equal(t, before.DBSize, u.DBSize)
-	require.Equal(t, before.HistoryRows, u.HistoryRows)
-	require.Nil(t, u.Estimate)
-
-	_, err = conn.ExecContext(context.Background(), "ROLLBACK")
-	require.NoError(t, err)
-	require.NoError(t, conn.Close())
-	vacuumGate.Lock()
-	vacuumUsage, vacuumDone = nil, nil
-	vacuumGate.Unlock()
-	close(done)
-}
-
-// runVacuum serves the snapshot only while it runs.
-func TestRunVacuumClearsSnapshot(t *testing.T) {
-	newHistoryCleanupTestDB(t)
-	seedHistory(t, time.Now(), 0)
-	require.NoError(t, runVacuum(context.Background()))
-	require.Nil(t, vacuumUsage)
-	require.NoError(t, PerformMaintenance())
-	require.Nil(t, vacuumUsage)
-	u, err := GetDatabaseUsage(context.Background(), 7)
-	require.NoError(t, err)
-	require.NotNil(t, u.Estimate)
-}
-
-// blockVacuum makes execVacuum wait for release before it runs VACUUM, and
-// reports when it was entered.
-func blockVacuum(t *testing.T) (entered <-chan struct{}, release func()) {
-	t.Helper()
-	original := execVacuum
-	in := make(chan struct{})
-	out := make(chan struct{})
-	execVacuum = func(ctx context.Context) error {
-		close(in)
-		<-out
-		return original(ctx)
-	}
-	var once sync.Once
-	release = func() { once.Do(func() { close(out) }) }
-	t.Cleanup(func() {
-		release()
-		execVacuum = original
-	})
-	return in, release
-}
-
-// A VACUUM run by maintenance (not by a cleanup) leaves the job state alone:
-// a usage poll answers at once from the snapshot, and an estimate request
-// waits for VACUUM and then gets a fresh estimate.
-func TestDatabaseUsageDuringMaintenanceVacuum(t *testing.T) {
-	newHistoryCleanupTestDB(t)
-	f := seedHistory(t, time.Now(), 0)
-	entered, release := blockVacuum(t)
-
-	maintained := make(chan error, 1)
-	go func() { maintained <- PerformMaintenance() }()
-	<-entered
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	u, err := GetDatabaseUsage(ctx, 0)
-	cancel()
-	require.NoError(t, err)
-	require.Equal(t, model.HistoryCleanupIdle, u.Job.State)
-	require.Nil(t, u.Estimate)
-
-	// A client that gives up while VACUUM runs gets its context error.
-	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
-	_, err = GetDatabaseUsage(ctx, 7)
-	cancel()
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-
-	estimated := make(chan *model.DatabaseUsage, 1)
-	go func() {
-		u, err := GetDatabaseUsage(context.Background(), 7)
-		assert.NoError(t, err)
-		estimated <- u
-	}()
-	select {
-	case <-estimated:
-		t.Fatal("the estimate was answered while VACUUM ran")
-	case <-time.After(100 * time.Millisecond):
-	}
-	release()
-	require.NoError(t, <-maintained)
-	select {
-	case u := <-estimated:
-		require.NotNil(t, u.Estimate)
-		require.Equal(t, int64(f.deleted), u.Estimate.DeletableRows)
-	case <-time.After(5 * time.Second):
-		t.Fatal("the estimate did not recover after VACUUM")
-	}
-}
-
-// The same holds for the VACUUM of a cleanup, whose job reads vacuuming.
-func TestDatabaseUsageDuringCleanupVacuum(t *testing.T) {
-	newHistoryCleanupTestDB(t)
-	seedHistory(t, time.Now(), 0)
-	entered, release := blockVacuum(t)
-
-	_, err := StartHistoryCleanup(7, true)
-	require.NoError(t, err)
-	<-entered
-	u, err := GetDatabaseUsage(context.Background(), 0)
-	require.NoError(t, err)
-	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
-	require.Nil(t, u.Estimate)
-	release()
-	job := waitHistoryCleanup(t)
-	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
-	u, err = GetDatabaseUsage(context.Background(), 7)
-	require.NoError(t, err)
-	require.NotNil(t, u.Estimate)
-}
-
-// When the usage cannot be taken before VACUUM, VACUUM does not run (the
-// usage requests would otherwise read the locked database).
-func TestVacuumSkippedWhenUsageCaptureFails(t *testing.T) {
-	newHistoryCleanupTestDB(t)
-	f := seedHistory(t, time.Now(), 0)
-	originalCapture, originalExec := captureVacuumUsage, execVacuum
-	t.Cleanup(func() { captureVacuumUsage, execVacuum = originalCapture, originalExec })
-	captureVacuumUsage = func(context.Context) (*model.DatabaseUsage, error) {
-		return nil, errors.New("injected capture failure")
-	}
-	var vacuums atomic.Int32
-	execVacuum = func(ctx context.Context) error {
-		vacuums.Add(1)
-		return originalExec(ctx)
-	}
-
-	require.Error(t, runVacuum(context.Background()))
-	require.NoError(t, PerformMaintenance()) // logs the failure
-	require.Zero(t, vacuums.Load())
-
-	_, err := StartHistoryCleanup(7, true)
-	require.NoError(t, err)
-	job := waitHistoryCleanup(t)
-	require.Equal(t, model.HistoryCleanupFailed, job.State)
-	require.Contains(t, job.Error, "injected capture failure")
-	require.Equal(t, int64(f.deleted), job.DeletedRows)
-	require.Zero(t, vacuums.Load())
-
-	// The page keeps working without a snapshot.
-	u, err := GetDatabaseUsage(context.Background(), 7)
-	require.NoError(t, err)
-	require.NotNil(t, u.Estimate)
-	require.Equal(t, job, u.Job)
 }
