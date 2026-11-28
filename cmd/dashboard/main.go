@@ -169,7 +169,7 @@ func main() {
 		func() error { return singleton.InitDBFromPath(dashboardCliParam.DatabaseLocation) },
 		// A compaction requested by a history cleanup runs before anything
 		// else uses the database or anything serves.
-		func() error { singleton.RunPendingVacuum(dashboardCliParam.DatabaseLocation); return nil },
+		func() error { singleton.RunPendingVacuum(); return nil },
 		singleton.InitTSDB,
 		func() error { return initSystem(serviceSentinelDispatchBus) },
 		func() error {

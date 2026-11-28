@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 
 	"github.com/nezhahq/nezha/model"
 )
@@ -112,7 +115,7 @@ func TestVacuumOnRestart(t *testing.T) {
 	// The process restarts.
 	dbMaintenanceMu.Unlock()
 	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
-	RunPendingVacuum(path)
+	RunPendingVacuum()
 	require.Equal(t, int32(1), vacuums.Load())
 	job = currentHistoryJob()
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
@@ -127,7 +130,7 @@ func TestVacuumOnRestart(t *testing.T) {
 
 	// A later start reports the same result and does not compact again.
 	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
-	RunPendingVacuum(path)
+	RunPendingVacuum()
 	require.Equal(t, int32(1), vacuums.Load())
 	require.Equal(t, job, currentHistoryJob())
 
@@ -152,7 +155,7 @@ func TestVacuumOnRestartInterrupted(t *testing.T) {
 	require.NoError(t, writeVacuumMarker(vacuumMarkerPath(path, vacuumRunningFile), vacuumMarker{
 		Job: model.HistoryCleanupJob{State: model.HistoryCleanupRestarting, VacuumMode: model.HistoryVacuumModeRestart, Vacuum: true, DeletedRows: 42},
 	}))
-	RunPendingVacuum(path)
+	RunPendingVacuum()
 	require.Zero(t, vacuums.Load())
 	job := currentHistoryJob()
 	require.Equal(t, model.HistoryCleanupFailed, job.State)
@@ -172,7 +175,7 @@ func TestVacuumOnRestartFailureAndDiskFull(t *testing.T) {
 	execVacuum = func(context.Context) error { return errors.New("injected VACUUM failure") }
 	t.Cleanup(func() { execVacuum = originalExec })
 	require.NoError(t, writeVacuumMarker(vacuumMarkerPath(path, vacuumPendingFile), pending))
-	RunPendingVacuum(path)
+	RunPendingVacuum()
 	job := currentHistoryJob()
 	require.Equal(t, model.HistoryCleanupFailed, job.State)
 	require.Contains(t, job.Error, "injected VACUUM failure")
@@ -180,7 +183,7 @@ func TestVacuumOnRestartFailureAndDiskFull(t *testing.T) {
 	execVacuum = originalExec
 	diskFreeFunc = func(string) int64 { return 1 }
 	require.NoError(t, writeVacuumMarker(vacuumMarkerPath(path, vacuumPendingFile), pending))
-	RunPendingVacuum(path)
+	RunPendingVacuum()
 	job = currentHistoryJob()
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State)
 	require.Equal(t, model.HistoryVacuumInsufficientDisk, job.VacuumSkipped)
@@ -191,4 +194,82 @@ func TestHistoryCleanupRequestCompatibility(t *testing.T) {
 	require.Equal(t, model.HistoryVacuumModeNone, model.HistoryCleanupRequest{}.VacuumModeOrDefault())
 	require.Equal(t, model.HistoryVacuumModeRestart, model.HistoryCleanupRequest{Vacuum: true, VacuumMode: model.HistoryVacuumModeRestart}.VacuumModeOrDefault())
 	require.Equal(t, model.HistoryVacuumModeNone, model.HistoryCleanupRequest{Vacuum: true, VacuumMode: model.HistoryVacuumModeNone}.VacuumModeOrDefault())
+}
+
+// openTestDB points DB at dsn for the rest of the test.
+func openTestDB(t *testing.T, dsn string) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.Service{}, &model.ServiceHistory{}))
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	DB = db
+}
+
+// A database opened through a file: URI is found by the request and by the
+// startup under the same path, so its compaction runs.
+func TestVacuumOnRestartWithFileURI(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	path := filepath.Join(t.TempDir(), "uri.db")
+	openTestDB(t, "file:"+path+"?_busy_timeout=5000")
+	f := seedHistory(t, time.Now(), 0)
+	restarts := withRestart(t, true)
+	require.Equal(t, path, testDBPath(t))
+	u, err := GetDatabaseUsage(context.Background(), 7)
+	require.NoError(t, err)
+	require.True(t, u.RestartAvailable)
+
+	_, err = StartHistoryCleanup(7, model.HistoryVacuumModeRestart)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return restarts.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
+	_, err = os.Stat(path + vacuumPendingFile)
+	require.NoError(t, err)
+
+	dbMaintenanceMu.Unlock()
+	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
+	RunPendingVacuum()
+	job := currentHistoryJob()
+	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
+	require.Equal(t, int64(f.deleted), job.DeletedRows)
+	_, err = os.Stat(path + vacuumPendingFile)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// Two databases in one directory keep their own markers: one never runs
+// or reports the other's compaction.
+func TestVacuumMarkersPerDatabase(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")
+	var vacuums atomic.Int32
+	originalExec := execVacuum
+	execVacuum = func(ctx context.Context) error { vacuums.Add(1); return originalExec(ctx) }
+	t.Cleanup(func() { execVacuum = originalExec })
+	pending := vacuumMarker{Job: model.HistoryCleanupJob{State: model.HistoryCleanupRestarting, VacuumMode: model.HistoryVacuumModeRestart, Vacuum: true, DeletedRows: 5}}
+
+	openTestDB(t, a)
+	require.NoError(t, writeVacuumMarker(vacuumMarkerPath(a, vacuumPendingFile), pending))
+
+	openTestDB(t, b)
+	RunPendingVacuum()
+	require.Zero(t, vacuums.Load())
+	require.Equal(t, model.HistoryCleanupIdle, currentHistoryJob().State)
+	_, err := os.Stat(a + vacuumPendingFile)
+	require.NoError(t, err, "b must not take a's marker")
+
+	openTestDB(t, a)
+	RunPendingVacuum()
+	require.Equal(t, int32(1), vacuums.Load())
+	require.Equal(t, model.HistoryCleanupSucceeded, currentHistoryJob().State)
+	_, err = os.Stat(a + vacuumResultFile)
+	require.NoError(t, err)
+
+	// b does not show a's result.
+	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupIdle})
+	openTestDB(t, b)
+	RunPendingVacuum()
+	require.Equal(t, model.HistoryCleanupIdle, currentHistoryJob().State)
+	require.Equal(t, int32(1), vacuums.Load())
 }

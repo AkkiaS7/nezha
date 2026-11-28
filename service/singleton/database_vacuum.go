@@ -8,11 +8,9 @@ import (
 	"log"
 	"math"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/nezhahq/nezha/model"
-	"github.com/nezhahq/nezha/pkg/backup"
 )
 
 // VACUUM holds SQLite's exclusive lock for its whole run: every dashboard
@@ -31,7 +29,9 @@ const (
 	restartStartupAllowanceSeconds = 15
 )
 
-// Markers next to the database for a compaction while restarting.
+// Suffixes of the markers of a compaction while restarting, appended to the
+// database file name (like SQLite's -journal), so each database file has
+// its own.
 const (
 	vacuumPendingFile = ".vacuum-pending"
 	vacuumRunningFile = ".vacuum-running"
@@ -69,8 +69,11 @@ func restartAvailable(dbPath string) bool {
 	return dbPath != "" && RequestRestart != nil && restartSupervised()
 }
 
-func vacuumMarkerPath(dbPath, name string) string {
-	return filepath.Join(filepath.Dir(dbPath), name)
+// vacuumMarkerPath returns the marker of the database file at dbPath, the
+// path SQLite reports for the open database (PRAGMA database_list), which
+// the requests and the startup both use.
+func vacuumMarkerPath(dbPath, suffix string) string {
+	return dbPath + suffix
 }
 
 // recommendVacuum fills the expected durations and the recommended mode of e.
@@ -150,10 +153,20 @@ func requestVacuumOnRestart(job model.HistoryCleanupJob, dbPath string, sizeBefo
 // makes its result the current cleanup job. It never stops the start: a
 // failure is reported in the result. A marker left by a run that did not
 // finish is reported as failed instead of being run again, so a VACUUM that
-// crashes the process cannot restart it forever.
-func RunPendingVacuum(dbDSN string) {
-	dbPath := backup.SQLiteFilePath(dbDSN)
-	if dbPath == "" || DB == nil {
+// crashes the process cannot restart it forever. The database path comes
+// from SQLite, as when the compaction was requested, so a file: URI DSN
+// finds its markers too.
+func RunPendingVacuum() {
+	if DB == nil {
+		return
+	}
+	st, err := readDBFileStats(context.Background())
+	if err != nil {
+		log.Printf("NEZHA>> pending database compaction: %v", err)
+		return
+	}
+	dbPath := st.path
+	if dbPath == "" {
 		return
 	}
 	pending := vacuumMarkerPath(dbPath, vacuumPendingFile)
