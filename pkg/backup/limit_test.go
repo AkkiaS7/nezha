@@ -52,10 +52,10 @@ func TestMaxBytesFromEnv(t *testing.T) {
 // diskFree runs the real implementation of the platform (statfs on unix,
 // GetDiskFreeSpaceEx on Windows).
 func TestDiskFreeReportsSpace(t *testing.T) {
-	free, err := diskFree(t.TempDir())
+	free, err := DiskFree(t.TempDir())
 	require.NoError(t, err)
 	assert.Positive(t, free)
-	_, err = diskFree(filepath.Join(t.TempDir(), "missing", "dir"))
+	_, err = DiskFree(filepath.Join(t.TempDir(), "missing", "dir"))
 	assert.Error(t, err)
 }
 

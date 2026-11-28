@@ -204,6 +204,5 @@ func resolveOptionalBool(formValue *bool, current bool) bool {
 // @Success 200 {object} model.CommonResponse[any]
 // @Router /maintenance [post]
 func runMaintenance(c *gin.Context) (any, error) {
-	singleton.PerformMaintenance()
-	return nil, nil
+	return nil, localizeDatabaseError(singleton.PerformMaintenance())
 }

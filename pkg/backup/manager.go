@@ -169,7 +169,7 @@ func NewManager(opts Options) (*Manager, error) {
 		opts.MaxBackupBytes = DefaultMaxBackupBytes
 	}
 	if opts.DiskFree == nil {
-		opts.DiskFree = diskFree
+		opts.DiskFree = DiskFree
 	}
 	if opts.RetryDelay <= 0 {
 		opts.RetryDelay = 2 * time.Second
