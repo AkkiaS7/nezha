@@ -340,3 +340,17 @@ msgstr "另一個備份或還原作業正在進行"
 #: cmd/dashboard/controller/backup.go:144
 msgid "backup file is corrupt or has been modified"
 msgstr "備份檔案已損毀或遭到修改"
+
+#: cmd/dashboard/controller/backup.go:112
+#: cmd/dashboard/controller/database.go:77
+msgid "another database cleanup or maintenance is in progress"
+msgstr "另一個資料庫清理或維護作業正在進行"
+
+#: cmd/dashboard/controller/database.go:73
+#, c-format
+msgid "retention days must be between %d and %d"
+msgstr "保留天數必須介於 %d 到 %d 之間"
+
+#: cmd/dashboard/controller/database.go:75
+msgid "service history is not stored in the SQLite database"
+msgstr "服務監控歷史未儲存在 SQLite 資料庫中"

@@ -337,3 +337,17 @@ msgstr ""
 #: cmd/dashboard/controller/backup.go:144
 msgid "backup file is corrupt or has been modified"
 msgstr ""
+
+#: cmd/dashboard/controller/backup.go:112
+#: cmd/dashboard/controller/database.go:77
+msgid "another database cleanup or maintenance is in progress"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:73
+#, c-format
+msgid "retention days must be between %d and %d"
+msgstr ""
+
+#: cmd/dashboard/controller/database.go:75
+msgid "service history is not stored in the SQLite database"
+msgstr ""
