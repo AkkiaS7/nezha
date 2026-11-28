@@ -167,6 +167,9 @@ func main() {
 			return nil
 		},
 		func() error { return singleton.InitDBFromPath(dashboardCliParam.DatabaseLocation) },
+		// A compaction requested by a history cleanup runs before anything
+		// else uses the database or anything serves.
+		func() error { singleton.RunPendingVacuum(dashboardCliParam.DatabaseLocation); return nil },
 		singleton.InitTSDB,
 		func() error { return initSystem(serviceSentinelDispatchBus) },
 		func() error {
@@ -184,7 +187,7 @@ func main() {
 	defer requestRestart()
 	var restartRequested atomic.Bool
 	singleton.RequestRestart = func() {
-		log.Println("NEZHA>> Restarting to apply a restore")
+		log.Println("NEZHA>> Restarting to apply a restore or compact the database")
 		restartRequested.Store(true)
 		requestRestart()
 	}
@@ -287,7 +290,7 @@ func main() {
 
 	close(errChan)
 	if restartRequested.Load() {
-		log.Println("NEZHA>> Exiting so that the supervisor restarts the dashboard with the restored data")
+		log.Println("NEZHA>> Exiting so that the supervisor restarts the dashboard")
 		os.Exit(3)
 	}
 }

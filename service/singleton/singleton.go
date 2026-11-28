@@ -1,7 +1,6 @@
 package singleton
 
 import (
-	"context"
 	_ "embed"
 	"iter"
 	"log"
@@ -310,7 +309,7 @@ func PerformMaintenance() error {
 	// 1. SQLite 维护
 	if DB != nil {
 		log.Println("NEZHA>> SQLite: Starting VACUUM...")
-		if err := runVacuum(context.Background()); err != nil {
+		if err := DB.Exec("VACUUM").Error; err != nil {
 			log.Printf("NEZHA>> SQLite: VACUUM failed: %v", err)
 		} else {
 			log.Println("NEZHA>> SQLite: VACUUM completed")
