@@ -193,15 +193,39 @@ func formatJobTime(t time.Time) string {
 // GetDatabaseUsage reports the database size and the service history
 // cleanup state. With retentionDays > 0 it also estimates what a cleanup with
 // that retention would remove.
+//
+// While a VACUUM runs (from a cleanup or PerformMaintenance) it does not read
+// the database, which VACUUM holds exclusively: without retentionDays it
+// answers at once with the sizes taken just before VACUUM and the current job
+// state; with retentionDays it waits until VACUUM ends, or ctx is done, and
+// then answers with a fresh estimate, so a page asking for one recovers by
+// itself.
 func GetDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUsage, error) {
-	// Readers hold the gate while they read, so runVacuum installs the
-	// snapshot only once no request is between its statements: VACUUM could
-	// otherwise take the lock in the middle of one.
-	vacuumGate.RLock()
-	defer vacuumGate.RUnlock()
-	if u := vacuumSnapshotLocked(); u != nil {
-		return u, nil
+	for {
+		// Readers hold the gate while they read, so runVacuum installs the
+		// snapshot only once no request is between its statements: VACUUM
+		// could otherwise take the lock in the middle of one.
+		vacuumGate.RLock()
+		if vacuumUsage == nil {
+			defer vacuumGate.RUnlock()
+			return readDatabaseUsage(ctx, retentionDays)
+		}
+		if retentionDays <= 0 {
+			u := vacuumSnapshotLocked()
+			vacuumGate.RUnlock()
+			return u, nil
+		}
+		done := vacuumDone
+		vacuumGate.RUnlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
+}
+
+func readDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUsage, error) {
 	st, err := readDBFileStats(ctx)
 	if err != nil {
 		return nil, err
@@ -414,29 +438,46 @@ func vacuumHasSpace(st dbFileStats) bool {
 }
 
 var (
-	// vacuumGate guards vacuumUsage; GetDatabaseUsage holds it for reading
-	// while it reads the database.
+	// vacuumGate guards vacuumUsage and vacuumDone; GetDatabaseUsage holds it
+	// for reading while it reads the database.
 	vacuumGate  sync.RWMutex
 	vacuumUsage *model.DatabaseUsage
+	// vacuumDone is closed when the running VACUUM ends.
+	vacuumDone chan struct{}
+)
+
+// Replaced by tests.
+var (
+	captureVacuumUsage = func(ctx context.Context) (*model.DatabaseUsage, error) {
+		return GetDatabaseUsage(ctx, 0)
+	}
+	execVacuum = func(ctx context.Context) error {
+		return DB.WithContext(ctx).Exec("VACUUM").Error
+	}
 )
 
 // runVacuum compacts the database. VACUUM holds SQLite's exclusive lock, so
 // a usage request reading the database would wait for it, and fail once a
-// large database takes longer than busy_timeout; meanwhile GetDatabaseUsage
-// answers from the usage taken just before, without the estimate, and with
-// the current job state. The caller holds dbMaintenanceMu.
+// large database takes longer than busy_timeout. runVacuum first takes the
+// usage that GetDatabaseUsage serves meanwhile; when that fails it does not
+// run VACUUM, since requests would then read the locked database. The caller
+// holds dbMaintenanceMu.
 func runVacuum(ctx context.Context) error {
-	if u, err := GetDatabaseUsage(ctx, 0); err == nil {
-		vacuumGate.Lock() // waits for requests still reading the database
-		vacuumUsage = u
-		vacuumGate.Unlock()
-		defer func() {
-			vacuumGate.Lock()
-			vacuumUsage = nil
-			vacuumGate.Unlock()
-		}()
+	u, err := captureVacuumUsage(ctx)
+	if err != nil {
+		return fmt.Errorf("VACUUM not started, reading the database usage failed: %w", err)
 	}
-	return DB.WithContext(ctx).Exec("VACUUM").Error
+	done := make(chan struct{})
+	vacuumGate.Lock() // waits for requests still reading the database
+	vacuumUsage, vacuumDone = u, done
+	vacuumGate.Unlock()
+	defer func() {
+		vacuumGate.Lock()
+		vacuumUsage, vacuumDone = nil, nil
+		vacuumGate.Unlock()
+		close(done)
+	}()
+	return execVacuum(ctx)
 }
 
 // vacuumSnapshotLocked returns a copy of the usage served while VACUUM runs,

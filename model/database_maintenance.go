@@ -42,8 +42,9 @@ type DatabaseUsage struct {
 	HistoryRows      int64  `json:"history_rows"`
 	HistoryOldestAt  string `json:"history_oldest_at"`
 	// Estimate is present when retention_days was given and history is
-	// available. While VACUUM runs the sizes are those taken just before it,
-	// and there is no estimate.
+	// available. While VACUUM runs, a request without retention_days gets the
+	// sizes taken just before it (and no estimate); a request with
+	// retention_days waits until VACUUM ends and gets a fresh estimate.
 	Estimate *HistoryCleanupEstimate `json:"estimate,omitempty"`
 	Job      HistoryCleanupJob       `json:"job"`
 }

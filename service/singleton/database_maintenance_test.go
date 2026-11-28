@@ -3,10 +3,14 @@ package singleton
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -350,12 +354,13 @@ func TestDatabaseUsageServedFromSnapshotDuringVacuum(t *testing.T) {
 	cancel()
 	require.Error(t, err)
 
+	done := make(chan struct{})
 	vacuumGate.Lock()
-	vacuumUsage = before
+	vacuumUsage, vacuumDone = before, done
 	vacuumGate.Unlock()
 	setHistoryJob(model.HistoryCleanupJob{State: model.HistoryCleanupVacuuming, RetentionDays: 30, Vacuum: true})
 	ctx, cancel = context.WithTimeout(context.Background(), 300*time.Millisecond)
-	u, err := GetDatabaseUsage(ctx, 30)
+	u, err := GetDatabaseUsage(ctx, 0)
 	cancel()
 	require.NoError(t, err)
 	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
@@ -367,8 +372,9 @@ func TestDatabaseUsageServedFromSnapshotDuringVacuum(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 	vacuumGate.Lock()
-	vacuumUsage = nil
+	vacuumUsage, vacuumDone = nil, nil
 	vacuumGate.Unlock()
+	close(done)
 }
 
 // runVacuum serves the snapshot only while it runs.
@@ -382,4 +388,128 @@ func TestRunVacuumClearsSnapshot(t *testing.T) {
 	u, err := GetDatabaseUsage(context.Background(), 7)
 	require.NoError(t, err)
 	require.NotNil(t, u.Estimate)
+}
+
+// blockVacuum makes execVacuum wait for release before it runs VACUUM, and
+// reports when it was entered.
+func blockVacuum(t *testing.T) (entered <-chan struct{}, release func()) {
+	t.Helper()
+	original := execVacuum
+	in := make(chan struct{})
+	out := make(chan struct{})
+	execVacuum = func(ctx context.Context) error {
+		close(in)
+		<-out
+		return original(ctx)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(out) }) }
+	t.Cleanup(func() {
+		release()
+		execVacuum = original
+	})
+	return in, release
+}
+
+// A VACUUM run by maintenance (not by a cleanup) leaves the job state alone:
+// a usage poll answers at once from the snapshot, and an estimate request
+// waits for VACUUM and then gets a fresh estimate.
+func TestDatabaseUsageDuringMaintenanceVacuum(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	f := seedHistory(t, time.Now(), 0)
+	entered, release := blockVacuum(t)
+
+	maintained := make(chan error, 1)
+	go func() { maintained <- PerformMaintenance() }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	u, err := GetDatabaseUsage(ctx, 0)
+	cancel()
+	require.NoError(t, err)
+	require.Equal(t, model.HistoryCleanupIdle, u.Job.State)
+	require.Nil(t, u.Estimate)
+
+	// A client that gives up while VACUUM runs gets its context error.
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err = GetDatabaseUsage(ctx, 7)
+	cancel()
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	estimated := make(chan *model.DatabaseUsage, 1)
+	go func() {
+		u, err := GetDatabaseUsage(context.Background(), 7)
+		assert.NoError(t, err)
+		estimated <- u
+	}()
+	select {
+	case <-estimated:
+		t.Fatal("the estimate was answered while VACUUM ran")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	require.NoError(t, <-maintained)
+	select {
+	case u := <-estimated:
+		require.NotNil(t, u.Estimate)
+		require.Equal(t, int64(f.deleted), u.Estimate.DeletableRows)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the estimate did not recover after VACUUM")
+	}
+}
+
+// The same holds for the VACUUM of a cleanup, whose job reads vacuuming.
+func TestDatabaseUsageDuringCleanupVacuum(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	seedHistory(t, time.Now(), 0)
+	entered, release := blockVacuum(t)
+
+	_, err := StartHistoryCleanup(7, true)
+	require.NoError(t, err)
+	<-entered
+	u, err := GetDatabaseUsage(context.Background(), 0)
+	require.NoError(t, err)
+	require.Equal(t, model.HistoryCleanupVacuuming, u.Job.State)
+	require.Nil(t, u.Estimate)
+	release()
+	job := waitHistoryCleanup(t)
+	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
+	u, err = GetDatabaseUsage(context.Background(), 7)
+	require.NoError(t, err)
+	require.NotNil(t, u.Estimate)
+}
+
+// When the usage cannot be taken before VACUUM, VACUUM does not run (the
+// usage requests would otherwise read the locked database).
+func TestVacuumSkippedWhenUsageCaptureFails(t *testing.T) {
+	newHistoryCleanupTestDB(t)
+	f := seedHistory(t, time.Now(), 0)
+	originalCapture, originalExec := captureVacuumUsage, execVacuum
+	t.Cleanup(func() { captureVacuumUsage, execVacuum = originalCapture, originalExec })
+	captureVacuumUsage = func(context.Context) (*model.DatabaseUsage, error) {
+		return nil, errors.New("injected capture failure")
+	}
+	var vacuums atomic.Int32
+	execVacuum = func(ctx context.Context) error {
+		vacuums.Add(1)
+		return originalExec(ctx)
+	}
+
+	require.Error(t, runVacuum(context.Background()))
+	require.NoError(t, PerformMaintenance()) // logs the failure
+	require.Zero(t, vacuums.Load())
+
+	_, err := StartHistoryCleanup(7, true)
+	require.NoError(t, err)
+	job := waitHistoryCleanup(t)
+	require.Equal(t, model.HistoryCleanupFailed, job.State)
+	require.Contains(t, job.Error, "injected capture failure")
+	require.Equal(t, int64(f.deleted), job.DeletedRows)
+	require.Zero(t, vacuums.Load())
+
+	// The page keeps working without a snapshot.
+	u, err := GetDatabaseUsage(context.Background(), 7)
+	require.NoError(t, err)
+	require.NotNil(t, u.Estimate)
+	require.Equal(t, job, u.Job)
 }
