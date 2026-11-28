@@ -216,7 +216,14 @@ func TestVacuumOnRestartWithFileURI(t *testing.T) {
 	openTestDB(t, "file:"+path+"?_busy_timeout=5000")
 	f := seedHistory(t, time.Now(), 0)
 	restarts := withRestart(t, true)
-	require.Equal(t, path, testDBPath(t))
+	// SQLite reports the resolved path (on macOS /private/var for /var):
+	// compare the file, not the string, and use what SQLite reports below.
+	reported := testDBPath(t)
+	want, err := os.Stat(path)
+	require.NoError(t, err)
+	got, err := os.Stat(reported)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(want, got), "%s is not %s", reported, path)
 	u, err := GetDatabaseUsage(context.Background(), 7)
 	require.NoError(t, err)
 	require.True(t, u.RestartAvailable)
@@ -224,7 +231,7 @@ func TestVacuumOnRestartWithFileURI(t *testing.T) {
 	_, err = StartHistoryCleanup(7, model.HistoryVacuumModeRestart)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return restarts.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
-	_, err = os.Stat(path + vacuumPendingFile)
+	_, err = os.Stat(reported + vacuumPendingFile)
 	require.NoError(t, err)
 
 	dbMaintenanceMu.Unlock()
@@ -233,7 +240,7 @@ func TestVacuumOnRestartWithFileURI(t *testing.T) {
 	job := currentHistoryJob()
 	require.Equal(t, model.HistoryCleanupSucceeded, job.State, job.Error)
 	require.Equal(t, int64(f.deleted), job.DeletedRows)
-	_, err = os.Stat(path + vacuumPendingFile)
+	_, err = os.Stat(reported + vacuumPendingFile)
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
