@@ -19,6 +19,8 @@ var (
 	ErrDatabaseBusy              = errors.New("another database cleanup or maintenance is in progress")
 	ErrServiceHistoryUnavailable = errors.New("service history is not stored in the SQLite database")
 	ErrInvalidRetentionDays      = errors.New("invalid retention days")
+	ErrInvalidVacuumMode         = errors.New("invalid vacuum mode")
+	ErrRestartUnavailable        = errors.New("the dashboard cannot restart itself")
 )
 
 const (
@@ -199,10 +201,11 @@ func GetDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUs
 		return nil, err
 	}
 	u := &model.DatabaseUsage{
-		DBSize:        st.size(),
-		FreePagesSize: st.freeSize(),
-		DiskFree:      st.diskFree(),
-		Job:           currentHistoryJob(),
+		DBSize:           st.size(),
+		FreePagesSize:    st.freeSize(),
+		DiskFree:         st.diskFree(),
+		RestartAvailable: restartAvailable(st.path),
+		Job:              currentHistoryJob(),
 	}
 	if !serviceHistoryAvailable() {
 		return u, nil
@@ -225,6 +228,7 @@ func GetDatabaseUsage(ctx context.Context, retentionDays int) (*model.DatabaseUs
 		if err != nil {
 			return nil, err
 		}
+		recommendVacuum(e, u.RestartAvailable)
 		u.Estimate = e
 	}
 	return u, nil
@@ -265,6 +269,7 @@ func estimateHistoryCleanup(ctx context.Context, days int, st dbFileStats, total
 	// VACUUM writes the compacted copy to a temporary file and keeps the
 	// overwritten pages in the rollback journal until it commits.
 	e.VacuumRequiredSize = st.size() + after
+	e.SizeAfter = after
 	return e, nil
 }
 
@@ -303,14 +308,28 @@ func setHistoryJob(job model.HistoryCleanupJob) {
 }
 
 // StartHistoryCleanup starts deleting service history older than
-// retentionDays in the background, and compacts the database afterwards when
-// vacuum is set. Only one cleanup or maintenance runs at a time.
-func StartHistoryCleanup(retentionDays int, vacuum bool) (model.HistoryCleanupJob, error) {
+// retentionDays in the background, then compacts the database as vacuumMode
+// says: not at all, online, or while the dashboard restarts. Only one cleanup
+// or maintenance runs at a time.
+func StartHistoryCleanup(retentionDays int, vacuumMode string) (model.HistoryCleanupJob, error) {
 	if !ValidHistoryRetentionDays(retentionDays) {
 		return model.HistoryCleanupJob{}, ErrInvalidRetentionDays
 	}
+	switch vacuumMode {
+	case model.HistoryVacuumModeNone, model.HistoryVacuumModeOnline, model.HistoryVacuumModeRestart:
+	default:
+		return model.HistoryCleanupJob{}, ErrInvalidVacuumMode
+	}
 	if !serviceHistoryAvailable() {
 		return model.HistoryCleanupJob{}, ErrServiceHistoryUnavailable
+	}
+	st, err := readDBFileStats(context.Background())
+	if err != nil {
+		return model.HistoryCleanupJob{}, err
+	}
+	dbPath := st.path
+	if vacuumMode == model.HistoryVacuumModeRestart && !restartAvailable(dbPath) {
+		return model.HistoryCleanupJob{}, ErrRestartUnavailable
 	}
 	if !dbMaintenanceMu.TryLock() {
 		return model.HistoryCleanupJob{}, ErrDatabaseBusy
@@ -318,21 +337,30 @@ func StartHistoryCleanup(retentionDays int, vacuum bool) (model.HistoryCleanupJo
 	job := model.HistoryCleanupJob{
 		State:         model.HistoryCleanupDeleting,
 		RetentionDays: retentionDays,
-		Vacuum:        vacuum,
+		Vacuum:        vacuumMode != model.HistoryVacuumModeNone,
+		VacuumMode:    vacuumMode,
 		StartedAt:     formatJobTime(time.Now()),
 	}
-	if !vacuum {
+	if !job.Vacuum {
 		job.VacuumSkipped = model.HistoryVacuumNotRequested
+	}
+	if dbPath != "" {
+		// The result of an earlier compaction while restarting is replaced,
+		// or the next start would report it again.
+		_ = os.Remove(vacuumMarkerPath(dbPath, vacuumResultFile))
 	}
 	setHistoryJob(job)
 	go func() {
-		defer dbMaintenanceMu.Unlock()
-		runHistoryCleanup(job)
+		if !runHistoryCleanup(job, dbPath) {
+			dbMaintenanceMu.Unlock()
+		}
 	}()
 	return job, nil
 }
 
-func runHistoryCleanup(job model.HistoryCleanupJob) {
+// runHistoryCleanup runs the job and reports whether it keeps
+// dbMaintenanceMu: a job that restarts the dashboard holds it until exit.
+func runHistoryCleanup(job model.HistoryCleanupJob, dbPath string) bool {
 	ctx := context.Background()
 	fail := func(err error) {
 		log.Printf("NEZHA>> service history cleanup failed after deleting %d rows: %v", job.DeletedRows, err)
@@ -344,7 +372,7 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 	before, err := readDBFileStats(ctx)
 	if err != nil {
 		fail(err)
-		return
+		return false
 	}
 	for _, step := range historyCleanupSteps(time.Now(), job.RetentionDays) {
 		query := "DELETE FROM service_histories WHERE id IN (SELECT id FROM service_histories WHERE " + step.cond + " LIMIT ?)"
@@ -353,7 +381,7 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 			res := DB.Exec(query, args...)
 			if res.Error != nil {
 				fail(res.Error)
-				return
+				return false
 			}
 			if res.RowsAffected == 0 {
 				break
@@ -364,20 +392,28 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 		}
 	}
 
-	if job.Vacuum {
+	if job.VacuumMode == model.HistoryVacuumModeRestart {
+		if err := requestVacuumOnRestart(job, dbPath, before.size()); err != nil {
+			fail(fmt.Errorf("deleted %d rows, but the compaction could not be scheduled: %w", job.DeletedRows, err))
+			return false
+		}
+		return true
+	}
+
+	if job.VacuumMode == model.HistoryVacuumModeOnline {
 		st, err := readDBFileStats(ctx)
 		if err != nil {
 			fail(err)
-			return
+			return false
 		}
 		if !vacuumHasSpace(st) {
 			job.VacuumSkipped = model.HistoryVacuumInsufficientDisk
 		} else {
 			job.State = model.HistoryCleanupVacuuming
 			setHistoryJob(job)
-			if err := DB.Exec("VACUUM").Error; err != nil {
+			if err := execVacuum(ctx); err != nil {
 				fail(fmt.Errorf("deleted %d rows, but VACUUM failed: %w", job.DeletedRows, err))
-				return
+				return false
 			}
 		}
 	}
@@ -389,6 +425,7 @@ func runHistoryCleanup(job model.HistoryCleanupJob) {
 	job.FinishedAt = formatJobTime(time.Now())
 	setHistoryJob(job)
 	log.Printf("NEZHA>> service history cleanup: deleted %d rows older than %d days, freed %d bytes", job.DeletedRows, job.RetentionDays, job.FreedSize)
+	return false
 }
 
 // vacuumHasSpace reports whether VACUUM can run: it writes the compacted copy

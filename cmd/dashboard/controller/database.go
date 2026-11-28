@@ -40,7 +40,7 @@ func getDatabaseUsage(c *gin.Context) (*model.DatabaseUsage, error) {
 // @Summary Clean up service history
 // @Security BearerAuth
 // @Schemes
-// @Description Starts deleting service history older than retention_days in the background (15-minute summaries are kept for at least 30 days), then compacts the database with VACUUM when vacuum is true. Poll GET /database/usage for the job state.
+// @Description Starts deleting service history older than retention_days in the background (15-minute summaries are kept for at least 30 days), then compacts the database as vacuum_mode says: none, online (VACUUM now; the dashboard does not answer meanwhile) or restart (the dashboard restarts and compacts before it serves; needs restart_available). Without vacuum_mode, vacuum true means online. Poll GET /database/usage for the job state.
 // @Tags admin required
 // @Accept json
 // @param request body model.HistoryCleanupRequest true "Cleanup request"
@@ -52,7 +52,7 @@ func startHistoryCleanup(c *gin.Context) (*model.HistoryCleanupJob, error) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return nil, err
 	}
-	job, err := singleton.StartHistoryCleanup(req.RetentionDays, req.Vacuum)
+	job, err := singleton.StartHistoryCleanup(req.RetentionDays, req.VacuumModeOrDefault())
 	if err != nil {
 		return nil, localizeDatabaseError(err)
 	}
@@ -73,6 +73,10 @@ func localizeDatabaseError(err error) error {
 		return l.ErrorT("retention days must be between %d and %d", model.HistoryCleanupMinRetentionDays, model.HistoryCleanupMaxRetentionDays)
 	case errors.Is(err, singleton.ErrServiceHistoryUnavailable):
 		return l.ErrorT("service history is not stored in the SQLite database")
+	case errors.Is(err, singleton.ErrInvalidVacuumMode):
+		return l.ErrorT("vacuum mode must be none, online or restart")
+	case errors.Is(err, singleton.ErrRestartUnavailable):
+		return l.ErrorT("the dashboard cannot restart itself, so it cannot compact the database while restarting")
 	case errors.Is(err, singleton.ErrDatabaseBusy):
 		return l.ErrorT("another database cleanup or maintenance is in progress")
 	}

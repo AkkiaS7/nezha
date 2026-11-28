@@ -655,7 +655,7 @@ msgstr "用户 ID 未指定"
 #~ msgstr "超时：agent 连接未建立"
 
 #: cmd/dashboard/controller/backup.go:112
-#: cmd/dashboard/controller/database.go:77
+#: cmd/dashboard/controller/database.go:81
 msgid "another database cleanup or maintenance is in progress"
 msgstr "另一个数据库清理或维护正在进行"
 
@@ -667,3 +667,11 @@ msgstr "保留天数必须在 %d 到 %d 之间"
 #: cmd/dashboard/controller/database.go:75
 msgid "service history is not stored in the SQLite database"
 msgstr "服务监控历史未存储在 SQLite 数据库中"
+
+#: cmd/dashboard/controller/database.go:77
+msgid "vacuum mode must be none, online or restart"
+msgstr "压缩方式必须是 none、online 或 restart"
+
+#: cmd/dashboard/controller/database.go:79
+msgid "the dashboard cannot restart itself, so it cannot compact the database while restarting"
+msgstr "面板无法自动重启，不能使用“重启时压缩”"
